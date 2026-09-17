@@ -769,6 +769,7 @@ internal sealed partial class UiAutomationService : IUiAutomation
             try { var v = SafeGetBstr(() => s_getCurrentBstr(comElement, UIA_PROPERTY_ID.UIA_AcceleratorKeyPropertyId), element.RequiresCurrentIdentity); if (v is not null) { props["AcceleratorKey"] = v; } } catch when (!element.RequiresCurrentIdentity) { }
             try { var v = SafeGetBstr(() => s_getCurrentBstr(comElement, UIA_PROPERTY_ID.UIA_AccessKeyPropertyId), element.RequiresCurrentIdentity); if (v is not null) { props["AccessKey"] = v; } } catch when (!element.RequiresCurrentIdentity) { }
             try { var v = SafeGetBstr(() => s_getCurrentBstr(comElement, UIA_PROPERTY_ID.UIA_HelpTextPropertyId), element.RequiresCurrentIdentity); if (v is not null) { props["HelpText"] = v; } } catch when (!element.RequiresCurrentIdentity) { }
+            try { var v = SafeGetFullDescription(comElement); if (v is not null) { props["FullDescription"] = v; } } catch when (!element.RequiresCurrentIdentity) { }
             try { props["IsPassword"] = comElement.get_CurrentIsContentElement() && comElement.get_CurrentControlType() == UIA_CONTROLTYPE_ID.UIA_EditControlTypeId; } catch when (!element.RequiresCurrentIdentity) { }
 
             // Pattern-specific properties
@@ -2454,6 +2455,7 @@ internal sealed partial class UiAutomationService : IUiAutomation
             Name = name,
             AutomationId = automationId,
             ClassName = SafeGetBstr(() => s_getCurrentBstr(element, UIA_PROPERTY_ID.UIA_ClassNamePropertyId), requireCurrentIdentity),
+            FullDescription = SafeGetFullDescription(element),
             IsEnabled = element.get_CurrentIsEnabled(),
             IsOffscreen = element.get_CurrentIsOffscreen(),
             X = rect.left,
@@ -2632,6 +2634,24 @@ internal sealed partial class UiAutomationService : IUiAutomation
         {
             var val = GetBstr(getter);
             return string.IsNullOrEmpty(val) ? null : val;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? SafeGetFullDescription(IUIAutomationElement element)
+    {
+        try
+        {
+            using var variant = element.GetCurrentPropertyValue(UIA_PROPERTY_ID.UIA_FullDescriptionPropertyId);
+            if (variant.VarType == VarEnum.VT_BSTR)
+            {
+                var val = variant.As<string>();
+                return string.IsNullOrEmpty(val) ? null : val;
+            }
+            return null;
         }
         catch
         {

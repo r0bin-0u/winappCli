@@ -27,6 +27,9 @@ public sealed class UiElement
     /// <summary>The element's UIA class name.</summary>
     public string? ClassName { get; set; }
 
+    /// <summary>The element's UIA full description, which may carry distinguishing text that Name/ClassName do not (e.g. WPS custom controls).</summary>
+    public string? FullDescription { get; set; }
+
     /// <summary><see langword="true"/> when the element accepts input.</summary>
     public bool IsEnabled { get; set; }
 
