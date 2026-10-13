@@ -9,6 +9,7 @@ using WinApp.Cli.ConsoleTasks;
 using WinApp.Cli.Models;
 using WinApp.Cli.Services;
 using WinApp.Cli.Tools;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace WinApp.Cli.Tests;
 
@@ -200,6 +201,28 @@ public class MsixServiceIdentityTests : BaseCommandTests
 
         Assert.IsTrue(File.Exists(Path.Combine(outputDir.FullName, "appxmanifest.xml")), "Manifest should be copied to PackagePath");
         Assert.AreEqual("exe-bytes", await File.ReadAllTextAsync(Path.Combine(outputDir.FullName, "TestApp.exe"), TestContext.CancellationToken));
+    }
+
+    /// <summary>
+    /// MSBuild escapes item specs in the recipe: a C++ Debug build lists the debug CRT as
+    /// "C:\Program Files %28x86%29\...\ucrtbased.dll".
+    /// </summary>
+    [TestMethod]
+    public async Task CopyFilesFromRecipeAsync_MSBuildEscapedSourcePath_IsUnescaped()
+    {
+        var srcDir = _tempDirectory.CreateSubdirectory("Program Files (x86)");
+        var srcManifest = new FileInfo(Path.Join(srcDir.FullName, "AppxManifest.xml"));
+        await File.WriteAllTextAsync(srcManifest.FullName, BuildMSBuildManifest(), TestContext.CancellationToken);
+        var srcData = new FileInfo(Path.Join(srcDir.FullName, "ucrtbased.dll"));
+        await File.WriteAllTextAsync(srcData.FullName, "crt", TestContext.CancellationToken);
+
+        var escaped = srcData.FullName.Replace("(", "%28").Replace(")", "%29");
+        var recipe = new FileInfo(WriteRecipe(srcManifest, (escaped, "ucrtbased.dll")));
+        var outputDir = new DirectoryInfo(Path.Join(_tempDirectory.FullName, "layout"));
+
+        await InvokeCopyFilesFromRecipeAsync(recipe, outputDir);
+
+        Assert.AreEqual("crt", await File.ReadAllTextAsync(Path.Join(outputDir.FullName, "ucrtbased.dll"), TestContext.CancellationToken));
     }
 
     [TestMethod]
@@ -1144,6 +1167,42 @@ public class MsixServiceIdentityTests : BaseCommandTests
     }
 
     /// <summary>
+    /// Where winapp can read but not write its state directory (a sandbox that only allows writes
+    /// to the project), <c>run</c> proceeds without the claim instead of waiting out the timeout.
+    /// </summary>
+    [TestMethod]
+    public void LayoutLease_StateDirectoryNotWritable_ProceedsWithoutWaiting()
+    {
+        var layout = _tempDirectory.CreateSubdirectory("layout-e");
+        var stateRoot = _tempDirectory.CreateSubdirectory("read-only-state");
+        var locks = stateRoot.CreateSubdirectory("layout-locks");
+
+        var user = System.Security.Principal.WindowsIdentity.GetCurrent().User!;
+        var deny = new System.Security.AccessControl.FileSystemAccessRule(
+            user,
+            System.Security.AccessControl.FileSystemRights.CreateFiles,
+            System.Security.AccessControl.AccessControlType.Deny);
+        var acl = locks.GetAccessControl();
+        acl.AddAccessRule(deny);
+        locks.SetAccessControl(acl);
+        try
+        {
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+
+            using (LayoutLease.Acquire(stateRoot, layout, TestContext.CancellationToken, TimeSpan.FromSeconds(30)))
+            {
+            }
+
+            Assert.IsLessThan(TimeSpan.FromSeconds(5), elapsed.Elapsed, "A read-only state directory must not make run wait out the timeout.");
+        }
+        finally
+        {
+            acl.RemoveAccessRule(deny);
+            locks.SetAccessControl(acl);
+        }
+    }
+
+    /// <summary>
     /// The shape of a packaged Windows Sandbox run, twice: the host deploys an exact payload into
     /// the guest, and the guest registers from a layout directory the host created beside it. When
     /// the app drops a file, the second run must drop it from that registration layout too --
@@ -1973,6 +2032,52 @@ public class MsixServiceIdentityTests : BaseCommandTests
         Assert.AreEqual("App", result.ApplicationId);
         Assert.IsTrue(File.Exists(Path.Combine(output.FullName, "appxmanifest.xml")), "Layout manifest should be produced from the recipe");
         Assert.HasCount(1, _fakeRegistration.RegisterLooseLayoutCalls);
+    }
+
+    [TestMethod]
+    public async Task AddLooseLayoutIdentityAsync_ExplicitExternalRecipeWinsOverPublishDirectoryManifest()
+    {
+        var publishDirectory = _tempDirectory.CreateSubdirectory("publish-output");
+        await File.WriteAllTextAsync(
+            Path.Join(publishDirectory.FullName, "Package.appxmanifest"),
+            BuildRawManifest("StalePackage", "stale.exe"),
+            TestContext.CancellationToken);
+
+        var generatedDirectory = _tempDirectory.CreateSubdirectory("generated-output");
+        var generatedManifest = new FileInfo(
+            Path.Join(generatedDirectory.FullName, "AppxManifest.xml"));
+        var nativeExe = new FileInfo(Path.Join(generatedDirectory.FullName, "native.exe"));
+        await File.WriteAllTextAsync(
+            generatedManifest.FullName,
+            BuildMSBuildManifest(),
+            TestContext.CancellationToken);
+        await File.WriteAllTextAsync(
+            nativeExe.FullName,
+            "native",
+            TestContext.CancellationToken);
+        var recipe = new FileInfo(WriteRecipe(
+            generatedManifest,
+            (nativeExe.FullName, "TestApp.exe")));
+        var output = new DirectoryInfo(Path.Join(publishDirectory.FullName, "AppX"));
+
+        await _msixService.AddLooseLayoutIdentityAsync(
+            generatedManifest,
+            publishDirectory,
+            output,
+            TestTaskContext,
+            selfContained: true,
+            appxRecipe: recipe,
+            cancellationToken: TestContext.CancellationToken);
+
+        Assert.AreEqual(
+            "native",
+            await File.ReadAllTextAsync(
+                Path.Join(output.FullName, "TestApp.exe"),
+                TestContext.CancellationToken));
+        Assert.IsFalse(File.Exists(Path.Join(output.FullName, "Package.appxmanifest")));
+        Assert.AreEqual(
+            Path.Join(output.FullName, "appxmanifest.xml"),
+            _fakeRegistration.RegisterLooseLayoutCalls.Single());
     }
 
     [TestMethod]
@@ -2949,6 +3054,9 @@ internal sealed class ScriptedMtBuildToolsService : IBuildToolsService
     public Func<string, string, bool>? ThrowWhen { get; set; }
 
     public FileInfo? GetBuildToolPath(string toolName) => _inner.GetBuildToolPath(toolName);
+
+    public VerifiedTool OpenVerifiedTool(FileInfo toolPath)
+        => VerifiedTool.Open(toolPath, static (_, _) => true, NullLogger.Instance);
 
     public Task<FileInfo> EnsureBuildToolAvailableAsync(string toolName, TaskContext taskContext, CancellationToken cancellationToken = default) =>
         _inner.EnsureBuildToolAvailableAsync(toolName, taskContext, cancellationToken);

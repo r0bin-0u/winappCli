@@ -14,9 +14,15 @@ using WinApp.Cli.Services.InteractiveDesktop;
 
 namespace WinApp.Cli.Commands;
 
-internal class UiDragCommand : Command, IShortDescription
+internal class UiDragCommand : Command, IShortDescription, IHelpExamples
 {
-    public string ShortDescription => "Drag from one element/point to another element/point";
+    public string ShortDescription => "Drag from one element or point to another";
+
+    public IReadOnlyList<string> Examples { get; } =
+    [
+        "winapp ui drag <selector> <selector> -a <app>",
+        "winapp ui drag 100,200 400,200 -w <hwnd>",
+    ];
 
     // drag <from> <to> — each endpoint is an element selector (drags from/to the element's center)
     // or screen x,y coordinates in the same space 'ui inspect' reports.
@@ -338,7 +344,7 @@ internal class UiDragCommand : Command, IShortDescription
             var element = await uiAutomation.FindSingleElementAsync(uiTarget, selector, cancellationToken);
             if (element is null)
             {
-                UiErrors.ElementNotFound(logger, token, json);
+                UiErrors.ElementNotFound(logger, token, json, target: uiTarget);
                 return new Endpoint(false, 0, 0, 0, null, null, null);
             }
 

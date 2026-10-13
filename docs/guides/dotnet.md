@@ -129,7 +129,7 @@ To force AUMID for a console app anyway, set the following inside any `<Property
 <WinAppRunUseExecutionAlias>false</WinAppRunUseExecutionAlias>
 ```
 
-If you'd rather choose the command name yourself, run `winapp manifest add-alias` to declare one in `Package.appxmanifest`; an alias you author is used as-is.
+If you'd rather choose the command name yourself, run `winapp manifest add-alias` to declare one in `Package.appxmanifest`; an alias you author is used as-is (unless you pass `--unique-identity`, which renames it).
 
 ## 5. Debug with Identity
 
@@ -189,6 +189,15 @@ winapp run .
 winapp run .\dotnet-app.csproj -c Debug --arch x64
 ```
 
+To run the project's Native AOT configuration, [enable AOT in the project](../usage.md#project-mode-net-sdk-projects) and run:
+
+```powershell
+winapp run . --aot
+winapp run . --aot -c Release
+```
+
+Use x64 or ARM64. For a one-time override, append `-p PublishAot=true`.
+
 You can still point `winapp run` at a pre-built output folder if you prefer (folder mode):
 
 ```powershell
@@ -201,6 +210,16 @@ Project mode supports both **packaged** and **unpackaged** WinUI apps — it det
 **Multi-project apps** (an app referencing class libraries) build correctly: winapp keeps `AnyCPU`/`netstandard2.0` references on their compatible platform instead of forcing the app's architecture across the graph. RID-only remains the default; when the effective configuration requires a self-contained profile (for example, a trimmed Release build), winapp selects the matching profile without changing referenced libraries' platforms.
 
 The `dotnet build` output streams live, with the exact invocation printed first. Add `--verbose` for winapp's own build decision traces. Requires .NET SDK 8.0.100 or newer. See [`winapp run` in the usage reference](../usage.md#project-mode-net-sdk-projects) for the full option list.
+
+For two worktrees of the same packaged project, use the CLI explicitly:
+
+```powershell
+winapp run .\dotnet-app.csproj --unique-identity
+winapp unregister .\dotnet-app.csproj
+```
+
+See [unique identity for parallel checkouts](../usage.md#unique-identity-for-parallel-checkouts).
+Don't pass `--unique-identity` to `dotnet run`; it would go to your app, not to winapp.
 
 > **No Windows SDK installed?** C#/WinRT authoring projects normally need a registered Windows SDK to build. When project mode detects none (clean CI, containers, SDK-less dev boxes), it points cswinrt at the winmds from the auto-restored `Microsoft.Windows.SDK.NET.Ref` package so the build still succeeds — no action needed. It does nothing when an SDK is installed or when you set `-p CsWinRTWindowsMetadata=…` yourself.
 
@@ -337,6 +356,8 @@ winapp pack .\bin\Release\net10.0-windows10.0.26100.0 --manifest .\Package.appxm
 ```
 
 > Note: The `pack` command automatically uses the Package.appxmanifest from your current directory and copies it to the target folder before packaging. The generated .msix file will be in the current directory.
+
+> Tip: You can also skip locating the build-output folder and pack straight from the project — `winapp package .\dotnet-app.csproj --cert .\devcert.pfx` publishes the project and packages its output in one step (project mode defaults to the Release configuration). Project mode accepts the build options `-c`, `--arch`, `-f`, `--no-build`, `--no-restore`, `-p`; add `--no-build` to package an existing build without rebuilding.
 
 ### Install the Certificate
 

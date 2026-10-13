@@ -10,9 +10,38 @@ internal class CertGenerateJsonOutput
 {
     public required string CertificatePath { get; set; }
     public required string Password { get; set; }
+
+    /// <summary>
+    /// <see langword="true"/> when the PFX is protected by the CLI's publicly known default
+    /// password, so the certificate must not be used to sign anything another person installs.
+    /// Always emitted, so a caller can branch on it without probing for an optional key.
+    /// </summary>
+    public required bool DefaultPasswordIsPublic { get; set; }
     public required string Publisher { get; set; }
     public required string SubjectName { get; set; }
     public string? PublicCertificatePath { get; set; }
+
+    /// <summary>
+    /// Security disclosures that the interactive run prints as status messages but <c>--json</c>
+    /// would otherwise drop. Omitted entirely when there is nothing to disclose.
+    /// </summary>
+    public List<string>? Warnings { get; set; }
+
+    /// <summary>
+    /// Always <see langword="false"/> here; <see cref="CertGenerateSkippedJsonOutput"/> carries
+    /// <see langword="true"/>, so callers can branch on one key for both shapes.
+    /// </summary>
+    public bool Skipped { get; }
+}
+
+/// <summary>
+/// Emitted by <c>cert generate --if-exists skip --json</c> when the output file already exists.
+/// The existing file is not opened, so only its path is reported.
+/// </summary>
+internal class CertGenerateSkippedJsonOutput
+{
+    public required string CertificatePath { get; set; }
+    public bool Skipped { get; } = true;
 }
 
 internal class CertInfoJsonOutput
@@ -105,6 +134,7 @@ internal sealed class FindUiCodeEntryJson
 /// Add new [JsonSerializable(typeof(...))] attributes here when adding --json output to more commands.
 /// </summary>
 [JsonSerializable(typeof(CertGenerateJsonOutput))]
+[JsonSerializable(typeof(CertGenerateSkippedJsonOutput))]
 [JsonSerializable(typeof(CertInfoJsonOutput))]
 [JsonSerializable(typeof(JsonErrorOutput))]
 [JsonSerializable(typeof(WinApp.Cli.Services.ApiSearch.ApiSearchOutput))]

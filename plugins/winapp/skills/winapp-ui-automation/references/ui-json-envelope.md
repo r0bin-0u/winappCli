@@ -63,7 +63,8 @@ the other window trees remain available.
 Element `x`, `y`, `width`, and `height` values are numbers in physical screen
 pixels. `0,0,0,0` is UI Automation's empty/no-displayed-UI rectangle in this
 projection. `isOffscreen` is independent: an offscreen element can still have
-nonzero bounds.
+nonzero bounds. `isEditable: true` marks elements with a writable value;
+`set-value` may still work on others.
 
 ## `ui inspect --ancestors --json`
 
@@ -78,10 +79,18 @@ text and JSON modes.
 
 ## `ui get-focused --json`
 
-Always emits an envelope (never a bare value):
+Successful queries emit an envelope (never a bare value):
 
-- No focus: `{ "hasFocus": false }`
+- No focused element can be verified as belonging to the target: `{ "hasFocus": false }`
 - With focus: `{ "hasFocus": true, "element": { ... } }`
+
+`-a` includes windows in the selected process. `-w` requires the exact window,
+not another same-process window or an owned popup. Ownership may be verified
+through a control's parent window when the control omits its own process ID.
+
+An actual focus or window-ownership query failure exits nonzero and emits the
+standard `{ "error": { ... } }` envelope on stderr, without a `hasFocus` result.
+Retry `get-focused`; rediscover the window with `list-windows` if it has closed.
 
 Pre-0.3.1 emitted bare `null` when nothing was focused.
 
@@ -204,6 +213,21 @@ The typed `element` object is the canonical way to consume geometry and boolean
 state. The existing `properties` values intentionally remain strings for
 backward compatibility.
 
+### Whole-document formatting
+
+```bash
+winapp ui get-property Document -a myapp --property FontWeight --json
+```
+
+The envelope above is unchanged; its `properties` map contains the requested
+formatting value, such as `"FontWeight": "700"`. Omitting `--property` includes
+the six [whole-document formatting attributes](https://github.com/microsoft/winappcli/blob/main/docs/ui-automation.md#whole-document-text-formatting).
+That reference defines their units, omission behavior, and the `Mixed`,
+`NotSupported`, and `Unavailable` states.
+
+Unknown, case-sensitive property names fail with `invalid_arguments` on stderr,
+not a successful null value. Omit `--property` to discover valid names.
+
 ## `ui status --json`
 
 The resolved target also reports its window DPI context:
@@ -229,6 +253,34 @@ The internal `id`, `parentSelector`, and `windowHandle` fields are
 **scrubbed** from typed element results — both at the top level and inside any
 nested `invokableAncestor`. Don't depend on them; use `selector` as the handle.
 
+## `ui invoke --json`
+
+```powershell
+winapp ui invoke AgreeCheckbox -a myapp --action toggle-on --json
+```
+
+```json
+{
+  "elementId": "AgreeCheckbox",
+  "pattern": "TogglePattern",
+  "requestedAction": "toggle-on",
+  "performedAction": "toggle",
+  "hwnd": 12345
+}
+```
+
+`requestedAction` is the supplied action, or `"auto"` when `--action` is omitted.
+`performedAction` is `"invoke"`, `"select"`, `"toggle"`, `"expand"`, or `"collapse"`.
+An already-correct `toggle-on` or `toggle-off` returns `"none"` without toggling;
+`pattern` still identifies the pattern used to read the state.
+`elementId` identifies the element acted on; automatic mode can report an
+ancestor, while explicit mode never acts on an ancestor.
+`hwnd` identifies that element's source window, which can differ from the main
+window when an app-scoped command selects a control in a secondary window.
+Failures emit the error envelope below on stderr, with a nonzero exit code and
+no success result. See the [action reference](https://github.com/microsoft/winappCli/blob/main/docs/ui-automation.md#invoke)
+for action semantics and recovery.
+
 ## Error envelope
 
 Every `winapp ui` command writes errors to **stderr** as:
@@ -240,13 +292,16 @@ Every `winapp ui` command writes errors to **stderr** as:
     "message": "…",
     "selector": "btn-save-c3d4",
     "details": "…",
+    "suggestions": ["…"],
     "recoveryHint": "…"
   }
 }
 ```
 
 Only `code` and `message` are always present; the rest are omitted when
-they do not apply.
+they do not apply. `suggestions` lists up to two command names when an
+unknown `winapp ui` command was typed (for example `ui dump` suggests
+`inspect`).
 
 ### Desktop coordination
 
@@ -257,7 +312,7 @@ appear:
 | `code` | Meaning |
 |---|---|
 | `invalid_ui_workflow_id` | `WINAPP_UI_WORKFLOW_ID` is set but empty/whitespace or longer than 256 characters. Fails before any UI side effect. |
-| `desktop_coordination_unavailable` | Coordination state could not be read, published, or safely rebuilt — including state written by a newer `winapp`. Mutating commands fail closed rather than acting uncoordinated. |
+| `desktop_coordination_unavailable` | Coordination state could not be read, published, or safely rebuilt — including state written by a newer `winapp`. Mutating commands fail closed rather than acting uncoordinated. If the coordination folder is only access-denied, commands run uncoordinated instead of returning this error. |
 | `queue_capacity_exceeded` | 64 commands from other workflows are already waiting for the desktop. Counts live foreign waiters, so entries left by commands that exited or were killed do not occupy a slot. |
 | `ui_turn_busy` | `ui yield` was run while this same workflow still has a command running or queued, so its turn is not idle. Nothing was released, and the running command is unaffected. Distinct from `invalid_arguments` (the request was well formed) and from `desktop_coordination_unavailable` (coordination is working — this is a valid request at an unsafe moment). Carries a `recoveryHint`: wait for or stop this workflow's other `winapp ui` commands — typically a `record` started with the same `WINAPP_UI_WORKFLOW_ID` — then retry `yield`. |
 | `cancelled` | Native Ctrl+C while the command was still waiting for its turn. The command never ran, so it has no UI side effects. Exit code **130**. |

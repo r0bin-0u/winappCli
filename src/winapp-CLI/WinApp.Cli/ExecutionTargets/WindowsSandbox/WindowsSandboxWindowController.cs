@@ -8,6 +8,7 @@ using WinApp.Cli.ExecutionTargets.Orchestration;
 using WinApp.Cli.Helpers;
 using Windows.Win32;
 using Windows.Win32.Foundation;
+using Windows.Win32.Graphics.Gdi;
 using Windows.Win32.UI.WindowsAndMessaging;
 
 namespace WinApp.Cli.ExecutionTargets.WindowsSandbox;
@@ -37,6 +38,13 @@ internal sealed class WindowsSandboxWindowSnapshot(HWND foregroundWindow)
 /// </param>
 internal sealed record SandboxClientWindow(nint Handle, int ProcessId, long StartTicksUtc);
 
+internal enum SandboxClientSurface
+{
+    Unknown,
+    Session,
+    TerminalError,
+}
+
 /// <summary>A live client window together with the evidence used to attribute it.</summary>
 /// <param name="Window">The window itself.</param>
 /// <param name="ParentProcessId">
@@ -45,12 +53,16 @@ internal sealed record SandboxClientWindow(nint Handle, int ProcessId, long Star
 /// that asked for it, so a client whose parent is the launcher winapp started is winapp's, and one
 /// whose parent is anything else is somebody else's.
 /// </param>
-internal sealed record SandboxClientCandidate(SandboxClientWindow Window, int? ParentProcessId);
+/// <param name="Surface">Current rendering evidence; unknown windows remain candidates, not successful surfaces.</param>
+internal sealed record SandboxClientCandidate(
+    SandboxClientWindow Window,
+    int? ParentProcessId,
+    SandboxClientSurface Surface = SandboxClientSurface.Unknown);
 
 /// <summary>A resolved client window and its current host-side state.</summary>
 internal sealed record SandboxClientStatus(SandboxClientWindow Window, bool IsMinimized);
 
-/// <summary>Keeps the connected Sandbox client non-minimized, off-screen, and non-activating.</summary>
+/// <summary>Keeps the connected Sandbox client non-minimized, behind the user's window, and non-activating.</summary>
 internal interface IWindowsSandboxWindowController
 {
     WindowsSandboxWindowSnapshot Capture();
@@ -122,7 +134,7 @@ internal interface IWindowsSandboxWindowController
 /// pick a concurrent caller's client whenever theirs arrived first, and no amount of waiting can
 /// turn "nothing else has shown up yet" into proof of ownership. When the proof is unavailable —
 /// Windows would not report the parent, or the launcher could not be identified — winapp claims
-/// nothing: the client is left visible and unrecorded rather than parked off-screen on a guess.
+/// nothing: the client is left where it is and unrecorded rather than moved on a guess.
 /// </para>
 /// </remarks>
 internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowController
@@ -136,6 +148,7 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
     private readonly Action<SandboxClientWindow, HWND> _park;
     private readonly Func<nint, bool> _isIconic;
     private readonly Func<HWND> _getForeground;
+    private readonly Func<nint, bool> _isOnScreen;
 
     /// <summary>Creates a controller that reads the real desktop.</summary>
     public WindowsSandboxWindowController()
@@ -147,12 +160,13 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
     public WindowsSandboxWindowController(IDesktopForegroundService foregroundService)
         : this(
             ListLiveClients,
-            (client, foreground) => PlaceOffScreen(
+            (client, foreground) => PlaceBehindForeground(
                 new HWND(client.Handle),
                 foreground,
                 foregroundService),
             handle => PInvoke.IsIconic(new HWND(handle)),
-            PInvoke.GetForegroundWindow)
+            PInvoke.GetForegroundWindow,
+            IsOnAnyMonitor)
     {
     }
 
@@ -161,15 +175,17 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
         Func<IReadOnlyList<SandboxClientCandidate>> listClients,
         Action<SandboxClientWindow, HWND>? park = null,
         Func<nint, bool>? isIconic = null,
-        Func<HWND>? getForeground = null)
+        Func<HWND>? getForeground = null,
+        Func<nint, bool>? isOnScreen = null)
     {
         _listClients = listClients;
-        _park = park ?? ((client, foreground) => PlaceOffScreen(
+        _park = park ?? ((client, foreground) => PlaceBehindForeground(
             new HWND(client.Handle),
             foreground,
             new DesktopForegroundService()));
         _isIconic = isIconic ?? (handle => PInvoke.IsIconic(new HWND(handle)));
         _getForeground = getForeground ?? PInvoke.GetForegroundWindow;
+        _isOnScreen = isOnScreen ?? (_ => true);
     }
 
     /// <summary>Delay seam, so waiting for the client is exercised without real waiting.</summary>
@@ -200,7 +216,7 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
             ? Task.FromResult<SandboxClientWindow?>(null)
             : WaitAndPlaceAsync(
                 snapshot,
-                attempt.Ownership,
+                attempt,
                 EarlyPollInterval,
                 cancellationToken);
     }
@@ -221,29 +237,31 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
         if (attempt.Ownership is null)
         {
             // Without the launcher there is no way to tell winapp's client from a concurrent
-            // caller's, and moving the wrong window off-screen is worse than moving none.
+            // caller's, and moving the wrong window is worse than moving none.
             Trace.TraceWarning(
                 "winapp could not identify the Windows Sandbox client it launched, so the window was " +
                 "left where the Sandbox put it.");
             return null;
         }
 
-        return await WaitAndPlaceAsync(snapshot, attempt.Ownership, PollInterval, cancellationToken)
+        return await WaitAndPlaceAsync(snapshot, attempt, PollInterval, cancellationToken)
             .ConfigureAwait(false);
     }
 
     private async Task<SandboxClientWindow?> WaitAndPlaceAsync(
         WindowsSandboxWindowSnapshot snapshot,
-        SandboxConnectOwnership ownership,
+        SandboxConnectAttempt attempt,
         TimeSpan pollInterval,
         CancellationToken cancellationToken)
     {
+        var ownership = attempt.Ownership!;
         var deadline = UtcNow() + WindowTimeout;
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var (client, ambiguous) = SelectOwnedClient(ownership, _listClients());
+            var clients = _listClients();
+            var (client, ambiguous) = SelectOwnedClient(ownership, clients);
 
             if (ambiguous)
             {
@@ -257,6 +275,19 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
             {
                 _park(client, snapshot.ForegroundWindow);
                 return client;
+            }
+
+            // A client winapp launched itself is a single window, so its error page is final: it
+            // will never show a session. Another Sandbox won, and unless some other Sandbox window
+            // is open, such as one opened from Start at the same moment, that Sandbox has none.
+            if (clients.Any(candidate =>
+                    candidate.Surface == SandboxClientSurface.TerminalError &&
+                    IsLauncher(candidate.Window, ownership)))
+            {
+                attempt.LostToWindowlessSandbox = !clients.Any(candidate =>
+                    candidate.Surface != SandboxClientSurface.TerminalError &&
+                    !IsLauncher(candidate.Window, ownership));
+                return null;
             }
 
             if (UtcNow() >= deadline)
@@ -274,12 +305,18 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
     }
 
     /// <summary>
-    /// Picks the client the launcher in <paramref name="ownership"/> created.
+    /// Picks the client the launcher in <paramref name="ownership"/> created, or the launcher itself
+    /// when winapp started the client directly.
     /// </summary>
     /// <remarks>
     /// Selection is by parentage <em>and</em> age. A client another <c>wsb connect</c> created is not
     /// a weaker candidate here, it is not a candidate at all, so this returns the same answer whether
     /// that other client appeared before winapp's, after it, or never.
+    /// <para>
+    /// A client winapp launched itself, to open a new Sandbox, is the launcher: its own process ID and
+    /// exact start time are the proof, so no parent is involved. A <c>wsb connect</c> process never
+    /// owns a client window, so this cannot match one by mistake.
+    /// </para>
     /// <para>
     /// The age test is what keeps the parent ID honest. Windows records a client's parent ID once, at
     /// creation, and never revises it — a client outlives its launcher, and once that launcher's ID
@@ -308,23 +345,52 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
 
         var owned = candidates
             .Where(candidate =>
+                candidate.Surface != SandboxClientSurface.TerminalError &&
                 candidate.Window.Handle != 0 &&
-                candidate.ParentProcessId == ownership.LauncherProcessId &&
                 candidate.Window.StartTicksUtc != 0 &&
-                candidate.Window.StartTicksUtc >= ownership.StartTicksUtc)
+                (IsLauncher(candidate.Window, ownership) ||
+                    (candidate.ParentProcessId == ownership.LauncherProcessId &&
+                        candidate.Window.StartTicksUtc >= ownership.StartTicksUtc)))
             .ToList();
 
         return owned.Count switch
         {
             0 => (null, false),
-            1 => (owned[0].Window, false),
+            1 => (owned[0].Surface == SandboxClientSurface.Session ? owned[0].Window : null, false),
             _ => (null, true),
         };
     }
 
+    /// <summary>Whether a client window belongs to the very process winapp launched.</summary>
+    private static bool IsLauncher(SandboxClientWindow window, SandboxConnectOwnership ownership) =>
+        window.ProcessId == ownership.LauncherProcessId &&
+        window.StartTicksUtc == ownership.StartTicksUtc;
+
     /// <inheritdoc/>
     public SandboxClientWindow ResolveClient(SandboxClientWindow? remembered) =>
-        ResolveClient(remembered, [.. _listClients().Select(candidate => candidate.Window)]);
+        ResolveCandidates(remembered, _listClients());
+
+    private static SandboxClientWindow ResolveCandidates(
+        SandboxClientWindow? remembered, IReadOnlyList<SandboxClientCandidate> live)
+    {
+        var candidates = live
+            .Where(candidate => candidate.Surface != SandboxClientSurface.TerminalError)
+            .ToArray();
+        var preferred = candidates.Any(candidate => candidate.Surface == SandboxClientSurface.Unknown)
+            ? null
+            : remembered;
+        var client = ResolveClient(preferred, [.. candidates.Select(candidate => candidate.Window)]);
+        if (!candidates.Any(candidate =>
+            candidate.Window == client && candidate.Surface == SandboxClientSurface.Session))
+        {
+            throw ExecutionTargetException.Create(
+                ExecutionTargetErrorCodes.NoInteractiveSession,
+                "The Windows Sandbox window is open, but its remote desktop could not be verified.",
+                userAction: "Wait for the existing Sandbox window to finish connecting, then retry. If it shows an error, follow the instructions in that window.");
+        }
+
+        return client;
+    }
 
     /// <inheritdoc/>
     public SandboxClientStatus InspectClient(SandboxClientWindow? remembered)
@@ -334,47 +400,83 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// A minimized client cannot prove what it is showing: its remote-desktop renderer drops out of
+    /// the UI tree until the window is restored, so verifying first would refuse exactly the window
+    /// this method exists to restore. The client is therefore restored first and verified
+    /// afterwards. The same applies to a client on no monitor at all, which is where winapp 0.7.0
+    /// parked it. Nothing is moved while it is unclear which window is the target.
+    /// </remarks>
     public SandboxClientStatus EnsureClientReady(
         SandboxClientWindow? remembered,
         TargetDesktopUse use)
     {
         var previousForeground = _getForeground();
-        var client = ResolveClient(remembered);
+        var live = _listClients();
 
-        if (!_isIconic(client.Handle))
+        if (SelectClientToRestore(remembered, live) is { } hidden &&
+            (_isIconic(hidden.Handle) || !_isOnScreen(hidden.Handle)))
         {
-            return new SandboxClientStatus(client, IsMinimized: false);
+            _park(hidden, previousForeground);
+            return VerifyRestored(hidden, previousForeground, use);
         }
 
-        if (remembered is null || client != remembered)
+        return new SandboxClientStatus(ResolveCandidates(remembered, live), IsMinimized: false);
+    }
+
+    /// <summary>
+    /// The one client that may be restored before it is verified: the remembered client, or the only
+    /// one open. Null when another client that cannot be verified makes the choice unclear.
+    /// </summary>
+    private static SandboxClientWindow? SelectClientToRestore(
+        SandboxClientWindow? remembered,
+        IReadOnlyList<SandboxClientCandidate> live)
+    {
+        var usable = live
+            .Where(candidate => candidate.Surface != SandboxClientSurface.TerminalError)
+            .ToArray();
+
+        if (remembered is not null &&
+            usable.Any(candidate => candidate.Window == remembered) &&
+            !usable.Any(candidate =>
+                candidate.Window != remembered && candidate.Surface == SandboxClientSurface.Unknown))
         {
-            throw NotReady(use, client, restored: false, foregroundPreserved: true, adopted: true);
+            return remembered;
         }
 
-        _park(client, previousForeground);
+        return usable.Length == 1 ? usable[0].Window : null;
+    }
 
-        var stillLive = _listClients()
-            .Select(candidate => candidate.Window)
-            .Any(candidate => candidate == client);
-        var restored = stillLive && !_isIconic(client.Handle);
+    private SandboxClientStatus VerifyRestored(
+        SandboxClientWindow client,
+        HWND previousForeground,
+        TargetDesktopUse use)
+    {
+        var current = _listClients();
+        var stillLive = current
+            .Any(candidate => candidate.Window == client && candidate.Surface == SandboxClientSurface.Session);
+        var restored = stillLive && ResolveCandidates(client, current) == client && !_isIconic(client.Handle);
         var foregroundPreserved =
             previousForeground.IsNull ||
             _getForeground() == previousForeground;
 
         if (!restored || !foregroundPreserved)
         {
-            throw NotReady(use, client, restored, foregroundPreserved, adopted: false);
+            throw NotReady(use, client, restored, foregroundPreserved);
         }
 
         return new SandboxClientStatus(client, IsMinimized: false);
     }
 
+    /// <summary>Whether any part of the window is on a connected monitor.</summary>
+    private static bool IsOnAnyMonitor(nint handle) =>
+        !PInvoke.MonitorFromWindow(new HWND(handle), MONITOR_FROM_FLAGS.MONITOR_DEFAULTTONULL).IsNull;
+
     private static ExecutionTargetException NotReady(
         TargetDesktopUse use,
         SandboxClientWindow client,
         bool restored,
-        bool foregroundPreserved,
-        bool adopted) =>
+        bool foregroundPreserved) =>
         ExecutionTargetException.Create(
             use == TargetDesktopUse.RealInput
                 ? ExecutionTargetErrorCodes.InputNotReady
@@ -382,16 +484,13 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
             use == TargetDesktopUse.RealInput
                 ? "The Windows Sandbox client is minimized and could not be restored without taking focus."
                 : "The Windows Sandbox client is minimized and could not be restored for capture without taking focus.",
-            userAction: adopted
-                ? "Restore or reconnect the existing Windows Sandbox window, then retry."
-                : "Restore the Windows Sandbox window, then retry.",
+            userAction: "Restore the Windows Sandbox window, then retry.",
             context: new Dictionary<string, string>
             {
                 ["clientProcessId"] = client.ProcessId.ToString(CultureInfo.InvariantCulture),
                 ["clientWindowHandle"] = client.Handle.ToString(CultureInfo.InvariantCulture),
                 ["restored"] = restored.ToString(),
                 ["foregroundPreserved"] = foregroundPreserved.ToString(),
-                ["adopted"] = adopted.ToString(),
             });
 
     /// <summary>
@@ -402,10 +501,10 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
     /// is what stops a handle persisted by an earlier winapp process from resolving against whatever
     /// owns that number now.
     /// <para>
-    /// With no usable record, a single open client is <em>adopted</em>: read where it stands, never
+    /// With no usable record, a single eligible client is <em>adopted</em>: read where it stands, never
     /// moved, and reported as adopted so a caller can see that winapp recognised the window rather
-    /// than created it. Only one Sandbox instance can exist at a time, so a lone client is
-    /// necessarily showing this target's desktop. Zero or several fail, because the alternative is
+    /// than created it. The caller excludes proven terminal errors and verifies the selected
+    /// client's rendering evidence separately. Zero or several fail, because the alternative is
     /// capturing a desktop winapp does not manage and reporting it as this target's.
     /// </para>
     /// </remarks>
@@ -429,10 +528,10 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
         {
             throw ExecutionTargetException.Create(
                 ExecutionTargetErrorCodes.NoInteractiveSession,
-                "The Windows Sandbox window is not open on this machine, so there is nothing to capture.",
+                "No usable Windows Sandbox window is open on this machine, so there is nothing to capture.",
                 userAction:
-                    "Run a command that needs the Sandbox desktop, such as 'winapp run . --on sandbox', so " +
-                    "winapp reconnects the window, then retry.",
+                    "Check existing Sandbox windows for errors. If none shows a connected desktop, " +
+                    "reconnect the existing Sandbox, then retry.",
                 example: "winapp target screenshot sandbox -o .\\sandbox.png");
         }
 
@@ -440,8 +539,8 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
             ExecutionTargetErrorCodes.TargetAmbiguous,
             $"{live.Count} Windows Sandbox windows are open, and winapp cannot prove which one it manages.",
             userAction:
-                "Close the Windows Sandbox windows winapp did not open, then run a command that reconnects " +
-                "its own, such as 'winapp run . --on sandbox'.",
+                "Wait for any connecting Windows Sandbox windows to finish, then retry. " +
+                "If several remote desktops remain open, choose which connection to keep before retrying.",
             context: new Dictionary<string, string>
             {
                 ["clientProcessIds"] = string.Join(
@@ -459,21 +558,51 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
         {
             using (process)
             {
-                process.Refresh();
-
-                if (process.MainWindowHandle != 0)
+                if (ReadCurrentWindow(process) is { } window)
                 {
-                    clients.Add(new SandboxClientCandidate(
-                        new SandboxClientWindow(
-                            process.MainWindowHandle,
-                            process.Id,
-                            TryReadStartTicks(process)),
-                        ParentProcessId.TryGet(process.Id)));
+                    var surface = SandboxClientErrorProbe.Inspect(window);
+                    var candidate = new SandboxClientCandidate(window, ParentProcessId.TryGet(process.Id), surface);
+                    if (RevalidateCandidate(candidate, ReadCurrentWindow(process)) is { } revalidated)
+                    {
+                        clients.Add(revalidated);
+                    }
                 }
             }
         }
 
         return clients;
+    }
+
+    internal static SandboxClientCandidate? RevalidateCandidate(
+        SandboxClientCandidate candidate, SandboxClientWindow? current)
+    {
+        if (current is null || current.Handle == 0)
+        {
+            return null;
+        }
+
+        return current == candidate.Window
+            ? candidate
+            : new SandboxClientCandidate(current, ParentProcessId: null, SandboxClientSurface.Unknown);
+    }
+
+    private static SandboxClientWindow? ReadCurrentWindow(Process process)
+    {
+        try
+        {
+            process.Refresh();
+            if (process.HasExited || process.MainWindowHandle == 0)
+            {
+                return null;
+            }
+
+            return new SandboxClientWindow(process.MainWindowHandle, process.Id, TryReadStartTicks(process));
+        }
+        catch (InvalidOperationException ex)
+        {
+            Trace.TraceWarning($"Sandbox client exited while reading its window identity: {ex.Message}");
+            return null;
+        }
     }
 
     /// <summary>UTC start ticks, or 0 when Windows will not say.</summary>
@@ -493,34 +622,121 @@ internal sealed class WindowsSandboxWindowController : IWindowsSandboxWindowCont
         }
     }
 
-    private static unsafe void PlaceOffScreen(
+    internal static unsafe void PlaceBehindForeground(
         HWND window,
         HWND previousForeground,
         IDesktopForegroundService foregroundService)
     {
+        // Restores a minimized client too: real input and capture stop while it is minimized.
         foregroundService.ShowWithoutActivation((long)window.Value);
 
-        var virtualLeft = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_XVIRTUALSCREEN);
-        var virtualTop = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_YVIRTUALSCREEN);
-        var offScreenX = virtualLeft - 32_000;
-
-        _ = PInvoke.SetWindowPos(
-            window,
-            new HWND(1), // HWND_BOTTOM
-            offScreenX,
-            virtualTop,
-            0,
-            0,
+        var flags =
             SET_WINDOW_POS_FLAGS.SWP_NOSIZE |
             SET_WINDOW_POS_FLAGS.SWP_NOACTIVATE |
             SET_WINDOW_POS_FLAGS.SWP_NOOWNERZORDER |
-            SET_WINDOW_POS_FLAGS.SWP_SHOWWINDOW);
+            SET_WINDOW_POS_FLAGS.SWP_SHOWWINDOW;
+
+        var foregroundExists = !previousForeground.IsNull && PInvoke.IsWindow(previousForeground);
+        var insertAfter = new HWND((void*)ChooseWindowToSitBehind(
+            (nint)window.Value,
+            (nint)previousForeground.Value,
+            foregroundExists,
+            foregroundExists && IsTopmost(previousForeground)));
+
+        if (insertAfter.IsNull)
+        {
+            flags |= SET_WINDOW_POS_FLAGS.SWP_NOZORDER;
+        }
+
+        // A window on no monitor at all -- parked off-screen by winapp 0.7.0, or left on a display
+        // that has since been disconnected -- is moved to the nearest monitor. A window that is
+        // visible anywhere keeps the position the user gave it.
+        var x = 0;
+        var y = 0;
+        if (TryFindOnScreenPosition(window, out var onScreenX, out var onScreenY))
+        {
+            x = onScreenX;
+            y = onScreenY;
+        }
+        else
+        {
+            flags |= SET_WINDOW_POS_FLAGS.SWP_NOMOVE;
+        }
+
+        _ = PInvoke.SetWindowPos(window, insertAfter, x, y, 0, 0, flags);
 
         if (!previousForeground.IsNull && PInvoke.GetForegroundWindow() == window)
         {
             RestoreForeground(previousForeground, window, foregroundService);
         }
     }
+
+    /// <summary>
+    /// The window the Sandbox client should sit directly behind, or 0 to leave its z-order alone.
+    /// </summary>
+    /// <remarks>
+    /// Directly behind what the user was working in, so the client never covers their work but is
+    /// still on screen to switch to. Not behind an always-on-top window: Windows makes a window
+    /// inserted after a topmost window topmost too, which would leave the Sandbox permanently above
+    /// every normal window. With no usable window to sit behind, the z-order is left alone.
+    /// </remarks>
+    internal static nint ChooseWindowToSitBehind(
+        nint window,
+        nint previousForeground,
+        bool previousForegroundExists,
+        bool previousForegroundIsTopmost) =>
+        previousForeground == 0 ||
+        previousForeground == window ||
+        !previousForegroundExists ||
+        previousForegroundIsTopmost
+            ? 0
+            : previousForeground;
+
+    private static bool IsTopmost(HWND window) =>
+        ((WINDOW_EX_STYLE)PInvoke.GetWindowLong(window, WINDOW_LONG_PTR_INDEX.GWL_EXSTYLE) &
+            WINDOW_EX_STYLE.WS_EX_TOPMOST) != 0;
+
+    /// <summary>
+    /// Where to move a window that is on no monitor at all: centred in the nearest monitor's work
+    /// area. Returns false for a window that is already at least partly visible.
+    /// </summary>
+    private static unsafe bool TryFindOnScreenPosition(HWND window, out int x, out int y)
+    {
+        x = 0;
+        y = 0;
+
+        if (!PInvoke.MonitorFromWindow(window, MONITOR_FROM_FLAGS.MONITOR_DEFAULTTONULL).IsNull)
+        {
+            return false;
+        }
+
+        var monitor = PInvoke.MonitorFromWindow(window, MONITOR_FROM_FLAGS.MONITOR_DEFAULTTONEAREST);
+        var info = new MONITORINFO { cbSize = (uint)sizeof(MONITORINFO) };
+        if (monitor.IsNull || !PInvoke.GetMonitorInfo(monitor, &info) || !PInvoke.GetWindowRect(window, out var bounds))
+        {
+            return false;
+        }
+
+        (x, y) = CenterInWorkArea(
+            info.rcWork.left,
+            info.rcWork.top,
+            info.rcWork.right,
+            info.rcWork.bottom,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top);
+        return true;
+    }
+
+    /// <summary>Centres a window in a work area, pinning it to the top-left when it is larger.</summary>
+    internal static (int X, int Y) CenterInWorkArea(
+        int left,
+        int top,
+        int right,
+        int bottom,
+        int width,
+        int height) =>
+        (left + Math.Max(0, (right - left - width) / 2),
+         top + Math.Max(0, (bottom - top - height) / 2));
 
     private static unsafe void RestoreForeground(
         HWND previousForeground,

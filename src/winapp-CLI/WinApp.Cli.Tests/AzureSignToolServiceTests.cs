@@ -348,9 +348,6 @@ internal sealed class FakeSignToolPackageInstallationService : IPackageInstallat
     public int EnsureCallCount { get; private set; }
     public Action? OnEnsure { get; set; }
 
-    public void InitializeWorkspace(DirectoryInfo rootDirectory)
-        => throw new NotImplementedException();
-
     public Task<Dictionary<string, string>> InstallPackagesAsync(
         DirectoryInfo rootDirectory,
         IEnumerable<string> packages,
@@ -378,6 +375,8 @@ internal sealed class FakeSignToolBuildToolsService : IBuildToolsService
 {
     public FileInfo? GetBuildToolPath(string toolName) => throw new NotImplementedException();
 
+    public VerifiedTool OpenVerifiedTool(FileInfo toolPath) => throw new NotImplementedException();
+
     public Task<FileInfo> EnsureBuildToolAvailableAsync(string toolName, TaskContext taskContext, CancellationToken cancellationToken = default)
         => throw new NotImplementedException();
 
@@ -399,6 +398,8 @@ internal sealed class RecordingBuildToolsService : IBuildToolsService
     public string? CapturedWorkingDirectory { get; private set; }
 
     public FileInfo? GetBuildToolPath(string toolName) => throw new NotImplementedException();
+
+    public VerifiedTool OpenVerifiedTool(FileInfo toolPath) => throw new NotImplementedException();
 
     public Task<FileInfo> EnsureBuildToolAvailableAsync(string toolName, TaskContext taskContext, CancellationToken cancellationToken = default)
         => Task.FromResult(SignToolToReturn);

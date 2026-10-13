@@ -15,7 +15,7 @@ internal enum WinAppRunMode
     /// <summary>Input is a build-output folder — the existing, unchanged behavior.</summary>
     Folder,
 
-    /// <summary>Input is a <c>.csproj</c> (or a directory containing exactly one buildable one).</summary>
+    /// <summary>Input is a <c>.csproj</c> or C++ <c>.vcxproj</c> (or a directory/solution that resolves to one).</summary>
     Project,
 
     /// <summary>
@@ -44,7 +44,7 @@ internal enum ProjectPackaging
 /// folder-mode path) or it is <see cref="WinAppRunMode.Project"/> and <see cref="Csproj"/> is set.
 /// </summary>
 /// <param name="Mode">The resolved run mode.</param>
-/// <param name="Csproj">The resolved project file, when <see cref="Mode"/> is Project.</param>
+/// <param name="Csproj">The resolved project file (<c>.csproj</c> or <c>.vcxproj</c>), when <see cref="Mode"/> is Project.</param>
 /// <param name="ProjectDirectory">The directory containing the project (project mode) or the input folder.</param>
 /// <param name="Solution">The solution the project was resolved from (defines <c>$(SolutionDir)</c> and siblings for the build/evaluate passes); null for a bare <c>.csproj</c>/directory input.</param>
 /// <param name="SelectionReason">Why this project was chosen for an ambiguous input (shown in the context line); null if unambiguous.</param>
@@ -84,6 +84,8 @@ internal sealed record PackageGraphSource(FileInfo AssetsFile, string? RuntimeId
 /// <param name="NoRestore">Mirrors <c>ProjectRunOptions.NoRestore</c>; threaded into the unpackaged <c>dotnet list package</c> discovery so it can't trigger a restore the user skipped.</param>
 /// <param name="RunArguments">Leading launch arguments MSBuild pairs with a non-apphost <see cref="RunCommand"/> (e.g. <c>exec "&lt;app&gt;.dll"</c>); prepended before the user's app args. Null for a plain apphost launch.</param>
 /// <param name="ProjectAssetsFile">The evaluated <c>ProjectAssetsFile</c> — restore's output for the inputs this build ran with. Package discovery reads the graph from it because <c>dotnet package list</c> re-evaluates the project and accepts no <c>-c</c>/<c>-r</c>/<c>-p</c>, and MSBuild ranks environment properties below a value the project assigns, so those inputs cannot be reproduced any other way.</param>
+/// <param name="Configuration">The evaluated MSBuild <c>Configuration</c> the output was built for. Set for C++ projects.</param>
+/// <param name="Platform">The evaluated MSBuild <c>Platform</c> (e.g. <c>x64</c>, <c>ARM64</c>, <c>Win32</c>) the output was built for. Set for C++ projects.</param>
 internal sealed record ProjectRunResolution(
     FileInfo Csproj,
     string TargetDir,
@@ -97,7 +99,12 @@ internal sealed record ProjectRunResolution(
     string? OutputType = null,
     bool? PreferExecutionAlias = null,
     string? ProjectAssetsFile = null,
-    string? ProjectAssetsRuntimeIdentifier = null);
+    string? ProjectAssetsRuntimeIdentifier = null,
+    bool IsAot = false,
+    string? AppxManifestPath = null,
+    string? AppxRecipePath = null,
+    string? Configuration = null,
+    string? Platform = null);
 
 /// <summary>
 /// User-provided build inputs for project mode, forwarded to <c>dotnet build</c> / <c>dotnet msbuild</c>.
@@ -113,6 +120,7 @@ internal sealed record ProjectRunResolution(
 /// <param name="Platform">The MSBuild <c>Platform</c> winapp injects (<c>-p:Platform=…</c>) into project-targeted passes when the target — and its whole <c>ProjectReference</c> closure — declares a <c>&lt;Platforms&gt;</c> that includes the target arch. Solution-scoped restore omits it because configuration-free <c>.slnx</c> files reject an explicit solution Platform. A RESOLVED input (see <c>ResolvePlatformInjection</c>), never user-supplied; null means arch is conveyed by the RID alone (the safe default). Older WindowsAppSDK targets hard-reject the default <c>Platform=AnyCPU</c> for self-contained / packaged builds, so the explicit Platform is what makes those projects build.</param>
 /// <param name="OmitRuntimeIdentifier">Suppresses the injected <c>-r win-&lt;arch&gt;</c> because an effective <c>Platform</c> already conveys the architecture AND the <c>ProjectReference</c> closure splits on <c>RuntimeIdentifier</c> — a combination that otherwise builds the same project twice and fails a packaged build with APPX1101. A RESOLVED input (see <c>ResolvePlatformInjection</c>).</param>
 /// <param name="PublishProfile">The architecture-matching publish profile used when MSIX tooling requires a trimmed build to be self-contained, the profile preserves the project's trimming, target framework, and architecture, and forcing a global <c>Platform</c> would break an AnyCPU project reference. Inferred profiles are scoped to the selected app through the .NET SDK's <c>ProjectToOverrideProjectExtensionsPath</c> property. A RESOLVED input (see <c>ResolveRequiredPublishProfileAsync</c>), never user-supplied.</param>
+/// <param name="ExactRuntimeIdentifier">An exact Windows RID (e.g. <c>win-x64</c>, <c>win10-x64</c>) that a lone <c>-p RuntimeIdentifier</c> supplied with no <c>--arch</c>. When set, it is forwarded to dotnet unchanged instead of the canonical <c>win-&lt;arch&gt;</c> derived from <see cref="Architecture"/>, so an exact/non-canonical RID is preserved (spec §4). <see cref="Architecture"/> is still derived from this RID for runtime provisioning. Null for every other caller, which conveys arch via the canonical RID.</param>
 internal sealed record ProjectRunOptions(
     string Configuration,
     string Architecture,
@@ -124,7 +132,17 @@ internal sealed record ProjectRunOptions(
     FileInfo? Solution = null,
     string? Platform = null,
     bool OmitRuntimeIdentifier = false,
-    string? PublishProfile = null);
+    string? PublishProfile = null,
+    string? ExactRuntimeIdentifier = null)
+{
+    /// <summary>
+    /// The RID passed to dotnet: an explicit exact-RID override (<see cref="ExactRuntimeIdentifier"/>)
+    /// when a lone <c>-p RuntimeIdentifier</c> requested one, otherwise the canonical
+    /// <c>win-&lt;arch&gt;</c> for <see cref="Architecture"/>.
+    /// </summary>
+    public string EffectiveRuntimeIdentifier =>
+        ExactRuntimeIdentifier is { Length: > 0 } exact ? exact : RunArchHelper.ToRuntimeIdentifier(Architecture);
+}
 
 /// <summary>
 /// The effective build inputs used to classify runnable candidates (multi-<c>.csproj</c> directory or
@@ -148,6 +166,41 @@ internal sealed record ProjectClassificationInputs(
 /// errors have already been surfaced and <see cref="ExitCode"/> is the non-zero dotnet exit code.
 /// </summary>
 internal sealed record ProjectBuildOutcome(ProjectRunResolution? Resolution, int ExitCode);
+
+/// <summary>
+/// Result of a native MSIX publish pass. <see cref="PackagePath"/> is the SDK-produced <c>.msix</c>
+/// (from the evaluated <c>AppxPackageOutput</c>), or <see langword="null"/> when publish/packaging failed,
+/// in which case <see cref="ExitCode"/> carries dotnet's exit code.
+/// </summary>
+internal sealed record NativeMsixPublishOutcome(FileInfo? PackagePath, int ExitCode);
+
+/// <summary>
+/// Publish inputs and package policy evaluated after restoring that graph, before native packaging
+/// overrides signing for its intermediate artifact.
+/// </summary>
+internal sealed record ProjectPackagePreparation(
+    ProjectRunOptions Options,
+    string? CsWinRTMetadata,
+    bool IsDefinitivelyUnpackaged,
+    bool IsNativeMsix,
+    ProjectSigningProperties? Signing);
+
+/// <summary>
+/// The project's evaluated MSIX signing configuration (spec §6), used to resolve one signing policy for
+/// the final artifact. All values are as MSBuild evaluated them; <see cref="KeyFilePath"/> is resolved to
+/// an absolute path. <see langword="null"/> members mean the property was unset.
+/// </summary>
+/// <param name="SigningEnabled"><c>AppxPackageSigningEnabled</c> (null = unset).</param>
+/// <param name="KeyFilePath">Absolute path of <c>PackageCertificateKeyFile</c>, or null.</param>
+/// <param name="Password"><c>PackageCertificatePassword</c>, or null (absent = no supplied password).</param>
+/// <param name="Thumbprint"><c>PackageCertificateThumbprint</c> (certificate-store signing), or null.</param>
+/// <param name="TimestampUrl"><c>AppxPackageSigningTimestampServerUrl</c>, or null.</param>
+internal sealed record ProjectSigningProperties(
+    bool? SigningEnabled,
+    string? KeyFilePath,
+    string? Password,
+    string? Thumbprint,
+    string? TimestampUrl);
 
 /// <summary>
 /// User-provided build inputs for single-file mode (a <c>.cs</c> file-based app).

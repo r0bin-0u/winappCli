@@ -15,14 +15,23 @@ using WinApp.Cli.Services.InteractiveDesktop;
 
 namespace WinApp.Cli.Commands;
 
-internal class UiScreenshotCommand : Command, IShortDescription
+internal class UiScreenshotCommand : Command, IShortDescription, IHelpExamples
 {
-    public string ShortDescription => "Capture a screenshot of a window or element";
+    public string ShortDescription => "Capture a window or element as PNG";
+
+    public IReadOnlyList<string> Examples { get; } =
+    [
+        "winapp ui screenshot -a <app> -o window.png",
+        "winapp ui screenshot <selector> -w <hwnd> -o element.png",
+    ];
+
+    public string? Usage => "winapp ui screenshot [<selector>] (-a <app> | -w <hwnd>) [options]";
 
     public UiScreenshotCommand()
         : base("screenshot", "Capture the target window or element as a PNG image. " +
-               "When multiple windows exist (e.g., dialogs), captures each to a separate file. " +
-               "With --json, returns file path and dimensions. Use --capture-screen for popup overlays.")
+               "Without an element selector, combines multiple windows into one labeled composite: " +
+               "--app by process name or PID includes the app's windows and their owned windows; a title match or --window selects one window plus its owned windows. " +
+               "With --json, returns file path and dimensions. Use --capture-screen with --window to capture one screen region, including visible overlays in place.")
     {
         Arguments.Add(SharedUiOptions.SelectorArgument);
         Options.Add(SharedUiOptions.AppOption);
@@ -32,11 +41,13 @@ internal class UiScreenshotCommand : Command, IShortDescription
         Options.Add(SharedUiOptions.OutputOption);
         Options.Add(SharedUiOptions.CaptureScreenOption);
         Options.Add(SharedUiOptions.FocusOption);
+        UiQueryOptions.AddTo(this);
     }
 
     public class Handler(
         IUiTargetResolver targetResolver,
         IUiAutomation uiAutomation,
+        IUiSelectorParser selectorParser,
         IOwnedWindowFinder ownedWindowFinder,
         ISystemUiQuery systemQuery,
         IAnsiConsole ansiConsole,
@@ -78,6 +89,12 @@ internal class UiScreenshotCommand : Command, IShortDescription
             {
                 UiErrors.MissingApp(logger, json);
                 return 1;
+            }
+
+            if (UiQueryOptions.ValidateWithOptionalSelector(
+                    parseResult, parseResult.GetValue(SharedUiOptions.SelectorArgument), logger, json) is { } invalid)
+            {
+                return invalid;
             }
 
             // Where the PNG goes is knowable now. Screenshot takes the desktop exclusively, so a command
@@ -173,7 +190,7 @@ internal class UiScreenshotCommand : Command, IShortDescription
                 await using (await turn.EnterAsync(cancellationToken).ConfigureAwait(false))
                 {
                     pass = await CaptureUnderSectionAsync(
-                        selector, app, window, json, captureScreen, focus,
+                        parseResult, selector, app, window, json, captureScreen, focus,
                         parseResult.InvocationConfiguration.Error, cancellationToken).ConfigureAwait(false);
                 }
 
@@ -197,6 +214,11 @@ internal class UiScreenshotCommand : Command, IShortDescription
                 logger.LogError("{Symbol} {Message}", UiSymbols.Error, foregroundEx.Message);
                 UiJsonError.Emit(json, UiJsonError.CodeForegroundNotTarget, foregroundEx.Message,
                     errorOut: parseResult.InvocationConfiguration.Error);
+                return 1;
+            }
+            catch (UiAmbiguousSelectorException ex)
+            {
+                UiErrors.AmbiguousSelector(logger, ex.Message, json, parseResult.InvocationConfiguration.Error);
                 return 1;
             }
             catch (System.Runtime.InteropServices.COMException comEx)
@@ -256,6 +278,7 @@ internal class UiScreenshotCommand : Command, IShortDescription
         /// Everything that reads the shared desktop. Runs entirely inside the caller's active section.
         /// </summary>
         private async Task<CapturePass> CaptureUnderSectionAsync(
+            ParseResult parseResult,
             string? selector,
             string? app,
             long? window,
@@ -318,6 +341,18 @@ internal class UiScreenshotCommand : Command, IShortDescription
                 return new CapturePass(1, singleTarget, selector, [], [], IsComposite: false);
             }
 
+            if (selector is not null)
+            {
+                var exact = await UiQueryOptions.ResolveExactSelectorAsync(
+                    parseResult, selectorParser, uiAutomation, singleTarget, selector, searchOtherWindows: false, ct).ConfigureAwait(false);
+                if (exact is null)
+                {
+                    UiErrors.ElementNotFound(logger, selector, json, target: singleTarget);
+                    return new CapturePass(1, singleTarget, selector, [], [], IsComposite: false);
+                }
+                selector = exact.Selector!;
+            }
+
             var (pixels, w, h) = await uiAutomation
                 .ScreenshotAsync(singleTarget, selector, captureScreen, focus, ct).ConfigureAwait(false);
 
@@ -368,7 +403,7 @@ internal class UiScreenshotCommand : Command, IShortDescription
                 return (long)info.Width * info.Height;
             }).ToList();
 
-            if (!json)
+            if (!json && logger.IsEnabled(LogLevel.Information))
             {
                 ansiConsole.MarkupLine($"[yellow]⚠  {windows.Count} windows detected. Compositing into single image.[/]");
             }
@@ -434,7 +469,7 @@ internal class UiScreenshotCommand : Command, IShortDescription
                         Captured = true,
                     });
 
-                    if (!json)
+                    if (!json && logger.IsEnabled(LogLevel.Information))
                     {
                         var owner = info.OwnerHwnd != 0 ? $", owner: HWND {info.OwnerHwnd}" : "";
                         ansiConsole.MarkupLine($"  [green]✓[/] HWND [cyan]{w.Hwnd}[/]: \"{Markup.Escape(title)}\" [grey]({info.Label}, {width}x{height}{owner})[/]");
@@ -503,9 +538,11 @@ internal class UiScreenshotCommand : Command, IShortDescription
                 ? captures.Max(c => c.Height) + LabelBarHeight
                 : captures[0].Height;
 
-            if (pass.IsComposite && !json)
+            if (pass.IsComposite && !json && logger.IsEnabled(LogLevel.Information))
             {
-                ansiConsole.MarkupLine($"  [green]✓[/] Saved composite: {absolutePath}");
+                // Keep paths intact on the wire: the host translates them after artifact delivery.
+                // Spectre rendering inserts line breaks before that translation can happen.
+                ansiConsole.Profile.Out.Writer.WriteLine($"  ✓ Saved composite: {absolutePath}");
             }
 
             if (json)
@@ -526,11 +563,10 @@ internal class UiScreenshotCommand : Command, IShortDescription
                 return 0;
             }
 
-            if (!pass.IsComposite)
+            if (!pass.IsComposite && logger.IsEnabled(LogLevel.Information))
             {
-                logger.LogInformation(
-                    "Screenshot of \"{WindowTitle}\" (PID {ProcessId}) saved to {Path} ({Width}x{Height}, {Size}KB)",
-                    pass.Target.WindowTitle, pass.Target.ProcessId, absolutePath, width, height, pngBytes.Length / 1024);
+                ansiConsole.Profile.Out.Writer.WriteLine(
+                    $"Screenshot of \"{TerminalText.Sanitize(pass.Target.WindowTitle)}\" (PID {pass.Target.ProcessId}) saved to {absolutePath} ({width}x{height}, {pngBytes.Length / 1024}KB)");
             }
 
             return 0;
@@ -552,14 +588,9 @@ internal class UiScreenshotCommand : Command, IShortDescription
             // Dark background
             canvas.Clear(new SKColor(30, 30, 30));
 
-            using var labelPaint = new SKPaint
-            {
-                Color = SKColors.White,
-                TextSize = 14,
-                IsAntialias = true,
-                Typeface = SKTypeface.FromFamilyName("Segoe UI", SKFontStyle.Normal)
-            };
-            using var typeface = labelPaint.Typeface;
+            using var labelTypeface = SKTypeface.FromFamilyName("Segoe UI", SKFontStyle.Normal);
+            using var labelFont = new SKFont(labelTypeface, 14) { Edging = SKFontEdging.Antialias };
+            using var labelPaint = new SKPaint { Color = SKColors.White, IsAntialias = true };
             using var labelBgPaint = new SKPaint { Color = new SKColor(50, 50, 50) };
 
             var x = 0;
@@ -569,7 +600,7 @@ internal class UiScreenshotCommand : Command, IShortDescription
                 canvas.DrawRect(x, 0, width, LabelBarHeight, labelBgPaint);
                 var labelText = $"HWND {hwnd} ({label})  {title}";
                 if (labelText.Length > 60) { labelText = labelText[..57] + "..."; }
-                canvas.DrawText(labelText, x + 6, LabelBarHeight - 8, labelPaint);
+                canvas.DrawText(labelText, x + 6, LabelBarHeight - 8, SKTextAlign.Left, labelFont, labelPaint);
 
                 // Draw window capture
                 using var windowBitmap = new SKBitmap(width, height, SKColorType.Bgra8888, SKAlphaType.Premul);
@@ -578,7 +609,9 @@ internal class UiScreenshotCommand : Command, IShortDescription
                     var ptr = (byte*)windowBitmap.GetPixels().ToPointer();
                     System.Runtime.InteropServices.Marshal.Copy(pixels, 0, (nint)ptr, pixels.Length);
                 }
-                canvas.DrawBitmap(windowBitmap, x, LabelBarHeight);
+
+                using var windowImage = SKImage.FromBitmap(windowBitmap);
+                canvas.DrawImage(windowImage, x, LabelBarHeight, SKSamplingOptions.Default);
 
                 x += width + WindowGap;
             }

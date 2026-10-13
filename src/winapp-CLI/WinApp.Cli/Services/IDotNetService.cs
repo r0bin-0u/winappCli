@@ -83,6 +83,11 @@ internal interface IDotNetService
     /// supports one.
     /// </para>
     /// </summary>
+    /// <remarks>
+    /// On normal completion (including a nonzero exit code), both output readers and their callbacks
+    /// have finished. Cancellation can interrupt output delivery; asynchronous work queued by
+    /// callbacks is not awaited.
+    /// </remarks>
     /// <param name="environmentOverrides">
     /// Optional environment variables to set on the child process (merged over the inherited
     /// environment). Use this to force locale-independent output, e.g. <c>DOTNET_CLI_UI_LANGUAGE=en</c>,
@@ -111,11 +116,17 @@ internal interface IDotNetService
     /// The callbacks are invoked on background threads; callers that touch shared state must
     /// synchronize. The command's own output is NOT written anywhere unless a callback does so.
     /// </summary>
+    /// <remarks>
+    /// On normal completion (including a nonzero exit code), both output readers and their callbacks
+    /// have finished. Cancellation can interrupt output delivery; asynchronous work queued by
+    /// callbacks is not awaited.
+    /// </remarks>
     Task<int> RunDotnetStreamingAsync(
         DirectoryInfo workingDirectory,
         string arguments,
         Action<string>? onOutputLine,
         Action<string>? onErrorLine,
+        IReadOnlyDictionary<string, string>? environmentOverrides = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -130,6 +141,7 @@ internal interface IDotNetService
     Task<int> RunDotnetInheritedAsync(
         DirectoryInfo workingDirectory,
         string arguments,
+        IReadOnlyDictionary<string, string>? environmentOverrides = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -160,7 +172,8 @@ internal interface IDotNetService
     /// </summary>
     /// <param name="projectOrFile">
     /// The project to query. A <c>.cs</c> .NET file-based app is also accepted and is queried through
-    /// the SDK 10 <c>dotnet package list --file</c> form.
+    /// the SDK 10 <c>dotnet package list --file</c> form. A C++ <c>.vcxproj</c> is read from its
+    /// <c>packages.config</c> without running <c>dotnet</c>.
     /// </param>
     /// <param name="includeTransitive">When true, includes transitive package references in the output.</param>
     /// <param name="noRestore">When true, pass <c>--no-restore</c> so the query doesn't trigger an implicit restore.</param>

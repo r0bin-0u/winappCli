@@ -15,7 +15,7 @@ internal interface IProjectRunService
     /// <summary>
     /// Classifies the run input into folder mode (existing behavior), project mode, or single-file mode.
     /// </summary>
-    /// <param name="input">The positional argument: a <c>.cs</c> file-based app, a <c>.csproj</c>/<c>.sln</c>/<c>.slnx</c> file, or a directory.</param>
+    /// <param name="input">The positional argument: a <c>.cs</c> file-based app, a <c>.csproj</c>/<c>.vcxproj</c>/<c>.sln</c>/<c>.slnx</c> file, or a directory.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <param name="projectSelector">
     /// Optional <c>--project</c> selector used to pick the runnable project when the input is a
@@ -74,6 +74,49 @@ internal interface IProjectRunService
     /// </summary>
     /// <exception cref="ProjectRunException">Thrown on a guardrail violation (e.g. a non-executable project).</exception>
     Task<ProjectBuildOutcome> BuildAndResolveAsync(
+        FileInfo csproj,
+        ProjectRunOptions options,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Publishes the project (<c>dotnet publish</c>, honoring <c>--no-build</c> as publish's own
+    /// skip-the-managed-Build semantics) and resolves the evaluated <c>PublishDir</c> as the payload, so
+    /// callers package what actually ships (deployment-transformed output: trimming, single-file,
+    /// ReadyToRun, Native AOT, self-contained). Mirrors <see cref="BuildAndResolveAsync"/> except the
+    /// returned <see cref="Models.ProjectRunResolution.TargetDir"/> is the publish directory.
+    /// </summary>
+    /// <exception cref="ProjectRunException">Thrown on a guardrail violation (e.g. a non-executable project).</exception>
+    Task<ProjectBuildOutcome> PublishAndResolveAsync(
+        FileInfo csproj,
+        ProjectPackagePreparation preparation,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Publishes a Native AOT project and resolves the generated payload used by <c>winapp run</c>.
+    /// </summary>
+    Task<ProjectBuildOutcome> PublishAotAndResolveAsync(
+        FileInfo csproj,
+        ProjectRunOptions options,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Publishes an MSIX-tooling project so the Windows App SDK's own MSIX targets produce the package
+    /// during publish (<c>PublishAppxPackage=true</c>), and returns the produced (unsigned) <c>.msix</c>.
+    /// The SDK owns file selection and native/managed filtering, so the caller signs and delivers the
+    /// artifact without repackaging it. <paramref name="packageDir"/> is a caller-owned scratch directory.
+    /// </summary>
+    Task<NativeMsixPublishOutcome> PublishNativeMsixAsync(
+        FileInfo csproj,
+        ProjectPackagePreparation preparation,
+        DirectoryInfo packageDir,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Prepares one architecture's publish inputs, restoring the publish graph unless NoBuild or
+    /// NoRestore is set, then evaluates package type, native tooling and signing in that context.
+    /// Returned inputs are reused unchanged by the publisher.
+    /// </summary>
+    Task<ProjectPackagePreparation> PreparePackageAsync(
         FileInfo csproj,
         ProjectRunOptions options,
         CancellationToken cancellationToken);

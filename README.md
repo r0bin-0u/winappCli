@@ -193,6 +193,18 @@ The direct links above are provided by [nightly.link](https://nightly.link), a t
 Note: Downloading artifacts from GitHub Actions requires you to be signed in to GitHub.
 </details>
 
+### Try a pull request build
+
+Open the PR's **Build and Package** run and download `cli-binaries`, `npm-package`,
+`msix-packages`, or `nuget-packages` from **Artifacts**. The `build-artifacts` job
+summary also links to each download.
+
+Packages appear **before validation finishes**. They are experimental builds,
+not evidence that tests passed. Wait for **build-and-package** to succeed if you
+need a fully validated build. If a download is not available yet, check the
+`build-artifacts` job for progress or errors. A new commit cancels older runs of
+the same PR.
+
 ## 📋 Usage
 
 Once installed (see [Installation](#-installation) above), verify the installation by calling the CLI:
@@ -234,6 +246,8 @@ See also: [Debugging Guide](./docs/debugging.md) — choosing between `winapp ru
 - [`az-sign`](./docs/usage.md#az-sign) - Sign with Azure Trusted Signing (cloud-managed identity, no local PFX)
 - [`create-external-catalog`](./docs/usage.md#create-external-catalog) - Generate CodeIntegrityExternal.cat for TrustedLaunch sparse packages
 
+See also: [Security guidance](./docs/security.md) — what development certificates and Developer Mode change on your machine, safe handling of `devcert.pfx`, and production signing.
+
 **Development Tools:**
 
 - [`tool`](./docs/usage.md#tool) - Access Windows SDK tools
@@ -243,7 +257,7 @@ See also: [Debugging Guide](./docs/debugging.md) — choosing between `winapp ru
 **Discovery** (agent-first — built for AI coding agents to ground generated code in real metadata and real samples, and usable by hand):
 
 - [`find-api`](./docs/usage.md#find-api) - Search and inspect the Windows/WinRT API surface (types, members, enums, namespaces) a project references
-- [`find-ui`](./docs/usage.md#find-ui) - Search WinUI controls & samples (WinUI 3 Gallery + Windows Community Toolkit; Reactor is opt-in via `--source reactor`) for a working code example
+- [`find-ui`](./docs/usage.md#find-ui) - Search WinUI controls & samples (WinUI 3 Gallery + Windows Community Toolkit, including its helpers, converters, and behaviors; Reactor is opt-in via `--source reactor`) for a working code example
 
 **Node.js/Electron Specific:**
 
@@ -252,7 +266,7 @@ See also: [Debugging Guide](./docs/debugging.md) — choosing between `winapp ru
 - [`node clear-electron-debug-identity`](./docs/usage.md#node-clear-electron-debug-identity) - Remove identity from Electron processes
 
 The full CLI usage can be found here: [Documentation](/docs/usage.md)
-The full NPM usage can be found here: [NPM Programmatic API Reference](/docs/npm-usage.md)
+Use winapp from JavaScript or TypeScript: [NPM programmatic guide](/docs/npm-usage.md)
 
 ## 🧾 Samples
 
@@ -261,6 +275,7 @@ This repository includes samples demonstrating how to use the CLI with various f
 | Sample | Description |
 |--------|-------------|
 | [C++ App](/samples/cpp-app/README.md) | Native C++ Win32 application with CMake |
+| [C++ WinUI App](/samples/cpp-winui-app/README.md) | Packaged C++/WinRT WinUI 3 app (Visual Studio `.vcxproj`, XAML) launched via `winapp run <vcxproj>` |
 | [.NET Console](/samples/dotnet-app/README.md) | .NET console application |
 | [WPF App](/samples/wpf-app/README.md) | WPF desktop application |
 | [WinUI App](/samples/winui-app/README.md) | Packaged WinUI 3 app registered and launched via `winapp run <csproj>` |

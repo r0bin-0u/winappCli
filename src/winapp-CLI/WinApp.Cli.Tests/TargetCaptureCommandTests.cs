@@ -58,6 +58,61 @@ public partial class TargetCaptureCommandTests
     // ---- snapshot ------------------------------------------------------------------
 
     [TestMethod]
+    public async Task Snapshot_WorkRootMatchesRelativeTransfersUnderTheReportedNondefaultRoot()
+    {
+        await using var harness = new Harness(GuestWindows());
+        using var console = new TestConsole();
+        var files = new GuestFileService(harness.GuestManaged);
+        var workRoot = files.ResolveScopeDirectory(TargetFileTransferService.WorkScope, create: false);
+
+        Assert.AreEqual(0, await RunSnapshotAsync(harness, console, "sandbox", "--json"));
+
+        using var document = JsonDocument.Parse(console.Output);
+        Assert.AreEqual(harness.GuestManaged,
+            document.RootElement.GetProperty("capabilities").GetProperty("managedRoot").GetString());
+        Assert.IsTrue(document.RootElement.TryGetProperty("workRoot", out var reported),
+            "Snapshot must expose the working directory separately from managedRoot.");
+        Assert.AreEqual(workRoot, reported.GetString());
+        Assert.IsFalse(Directory.Exists(workRoot), "Reporting the work root must not create it.");
+        Assert.AreEqual(0, harness.Backend.EnsureCalls);
+        Assert.AreEqual(0, harness.Rendering.ResolveSurfaceCalls);
+    }
+
+    [TestMethod]
+    public async Task Snapshot_HumanOutputReportsWorkRoot()
+    {
+        await using var harness = new Harness(GuestWindows());
+        using var console = new TestConsole();
+        console.Profile.Width = 240;
+
+        Assert.AreEqual(0, await RunSnapshotAsync(harness, console, "sandbox"));
+
+        StringAssert.Contains(console.Output, "Work root: " +
+            new GuestFileService(harness.GuestManaged)
+                .ResolveScopeDirectory(TargetFileTransferService.WorkScope, create: false));
+    }
+
+    [TestMethod]
+    [DataRow(false, false, false)]
+    [DataRow(true, false, true)]
+    [DataRow(true, true, false)]
+    public async Task Snapshot_UnavailableRootDoesNotInventWorkRoot(
+        bool running, bool agentAnswers, bool reportsManagedRoot)
+    {
+        await using var harness = new Harness(GuestWindows());
+        harness.Backend.Running = running;
+        harness.Backend.AgentAnswers = agentAnswers;
+        harness.Backend.ReportsManagedRoot = reportsManagedRoot;
+        using var console = new TestConsole();
+
+        Assert.AreEqual(0, await RunSnapshotAsync(harness, console, "sandbox", "--json"));
+
+        using var document = JsonDocument.Parse(console.Output);
+        Assert.IsFalse(document.RootElement.TryGetProperty("workRoot", out _));
+        Assert.AreEqual(0, harness.Backend.EnsureCalls);
+    }
+
+    [TestMethod]
     public async Task Snapshot_ReportsReadinessTheDesktopWindowAndWhatIsOnIt()
     {
         await using var harness = new Harness(GuestWindows(Window(0x20, "Calculator", 800, 600)));
@@ -165,6 +220,115 @@ public partial class TargetCaptureCommandTests
         StringAssert.Contains(console.Output, "winapp run . --on sandbox");
         Assert.AreEqual(0, harness.Backend.EnsureCalls);
     }
+
+    [TestMethod]
+    public async Task Snapshot_NothingRunning_ShowsFailedHostChecksWithTheirFix()
+    {
+        await using var harness = new Harness(GuestWindows());
+        harness.Backend.Running = false;
+        harness.Backend.Host = NotReadyHost();
+        using var console = new TestConsole();
+        console.Profile.Width = 400;
+
+        Assert.AreEqual(0, await RunSnapshotAsync(harness, console, "sandbox"));
+
+        StringAssert.Contains(console.Output, "Host: not ready");
+        StringAssert.Contains(console.Output, "sandboxClient: FAILED - client missing");
+        StringAssert.Contains(console.Output, "Fix: Open Windows Sandbox from the Start menu.");
+        StringAssert.Contains(console.Output, "wsb: not checked");
+        StringAssert.Contains(console.Output, "Fix the failed host checks, then start one with");
+        Assert.AreEqual(0, harness.Backend.EnsureCalls);
+    }
+
+    [TestMethod]
+    public async Task Snapshot_Json_IncludesHostChecks()
+    {
+        await using var harness = new Harness(GuestWindows());
+        harness.Backend.Running = false;
+        harness.Backend.Host = NotReadyHost();
+        using var console = new TestConsole();
+
+        Assert.AreEqual(0, await RunSnapshotAsync(harness, console, "sandbox", "--json"));
+
+        using var json = JsonDocument.Parse(console.Output);
+        var host = json.RootElement.GetProperty("host");
+        Assert.IsFalse(host.GetProperty("ready").GetBoolean());
+        var client = host.GetProperty("checks")[0];
+        Assert.AreEqual("sandboxClient", client.GetProperty("name").GetString());
+        Assert.AreEqual("failed", client.GetProperty("status").GetString());
+        Assert.AreEqual("notChecked", host.GetProperty("checks")[1].GetProperty("status").GetString());
+    }
+
+    [TestMethod]
+    public async Task Snapshot_TargetWithoutHostChecks_OmitsHost()
+    {
+        await using var harness = new Harness(GuestWindows());
+        harness.Backend.Running = false;
+        using var console = new TestConsole();
+
+        Assert.AreEqual(0, await RunSnapshotAsync(harness, console, "sandbox", "--json"));
+
+        using var json = JsonDocument.Parse(console.Output);
+        Assert.IsFalse(json.RootElement.TryGetProperty("host", out _));
+    }
+
+    [TestMethod]
+    public async Task Snapshot_InspectionFails_StillReportsHostChecksWithTheError()
+    {
+        await using var harness = new Harness(GuestWindows());
+        harness.Backend.Host = NotReadyHost();
+        harness.Backend.AttachError = new ExecutionTargetErrorInfo
+        {
+            Code = ExecutionTargetErrorCodes.Unsupported,
+            Message = "wsb.exe is not available.",
+        };
+        using var console = new TestConsole();
+
+        var (exitCode, stderr) = await CaptureStandardErrorAsync(() =>
+            RunSnapshotAsync(harness, console, "sandbox", "--json"));
+
+        Assert.AreEqual(TargetOutput.TargetInfrastructureExitCode, exitCode);
+        using var json = JsonDocument.Parse(stderr);
+        Assert.AreEqual(ExecutionTargetErrorCodes.Unsupported, json.RootElement.GetProperty("error").GetProperty("code").GetString());
+        Assert.IsFalse(json.RootElement.GetProperty("host").GetProperty("ready").GetBoolean());
+    }
+
+    [TestMethod]
+    public async Task Snapshot_InspectionFails_WritesHostChecksToStderrWithTheError()
+    {
+        await using var harness = new Harness(GuestWindows());
+        harness.Backend.Host = NotReadyHost();
+        harness.Backend.AttachError = new ExecutionTargetErrorInfo
+        {
+            Code = ExecutionTargetErrorCodes.Unsupported,
+            Message = "wsb.exe is not available.",
+        };
+        using var console = new TestConsole();
+
+        var (exitCode, stderr) = await CaptureStandardErrorAsync(() =>
+            RunSnapshotAsync(harness, console, "sandbox"));
+
+        Assert.AreEqual(TargetOutput.TargetInfrastructureExitCode, exitCode);
+        StringAssert.Contains(stderr, "Fix: Open Windows Sandbox from the Start menu.");
+        StringAssert.Contains(stderr, "wsb.exe is not available.");
+        Assert.IsFalse(console.Output.Contains("Host:", StringComparison.Ordinal));
+    }
+
+    private static TargetHostReadiness NotReadyHost() => new()
+    {
+        Ready = false,
+        Checks =
+        [
+            new TargetHostCheck
+            {
+                Name = "sandboxClient",
+                Status = TargetHostCheckStatus.Failed,
+                Detail = "client missing",
+                Fix = "Open Windows Sandbox from the Start menu.",
+            },
+            new TargetHostCheck { Name = "wsb", Status = TargetHostCheckStatus.NotChecked, Detail = "waiting" },
+        ],
+    };
 
     [TestMethod]
     public async Task Snapshot_NothingRunning_Json_ReportsItWithoutAnEpochOrCapabilities()
@@ -513,6 +677,42 @@ public partial class TargetCaptureCommandTests
 
         Assert.IsFalse(output.Desktop.Rendered);
         Assert.AreEqual(ExecutionTargetErrorCodes.Unsupported, output.Desktop.Unavailable);
+    }
+
+    [TestMethod]
+    [DataRow(unchecked((int)0x80070005))]
+    [DataRow(unchecked((int)0x80070057))]
+    public async Task Snapshot_MappedViewerFailure_PreservesUnavailableJson(int hresult)
+    {
+        await using var harness = new Harness(GuestWindows());
+        using var console = new TestConsole();
+        var window = new SandboxClientWindow(DesktopHwnd, DesktopProcessId, 1);
+        var controller = new WindowsSandboxWindowController(
+            () =>
+            {
+                var surface = SandboxClientErrorProbe.Inspect(window, _ =>
+                {
+                    System.Runtime.InteropServices.Marshal.ThrowExceptionForHR(hresult);
+                    throw new AssertFailedException("The failing HRESULT must throw.");
+                });
+                return [new SandboxClientCandidate(window, ParentProcessId: null, surface)];
+            },
+            isIconic: _ => false);
+        harness.Rendering.InspectSurface = () =>
+        {
+            var status = controller.InspectClient(null);
+            return new TargetDesktopSurface(status.Window.Handle, status.Window.ProcessId,
+                "WindowsSandboxRemoteSession", Adopted: true, IsMinimized: status.IsMinimized);
+        };
+
+        Assert.AreEqual(0, await RunSnapshotAsync(harness, console, "sandbox", "--json"));
+        var output = Deserialize(console.Output);
+        Assert.IsFalse(output.Desktop.Rendered);
+        Assert.IsFalse(output.Desktop.EffectiveInputReady);
+        Assert.IsFalse(output.Desktop.EffectiveCaptureReady);
+        Assert.AreEqual(ExecutionTargetErrorCodes.NoInteractiveSession, output.Desktop.Unavailable);
+        Assert.AreEqual(0, harness.Backend.EnsureCalls);
+        Assert.AreEqual(0, harness.Rendering.ResolveSurfaceCalls);
     }
 
     [TestMethod]
@@ -1138,9 +1338,18 @@ public partial class TargetCaptureCommandTests
         string stdout,
         int exitCode,
         IAppLauncherService? appLauncher)
-        : IExecutionTargetBackend, IInspectableTarget
+        : IExecutionTargetBackend, IInspectableTarget, IHostReadinessTarget
     {
         public ExecutionTargetRef Target { get; set; } = WindowsSandboxTarget.Default;
+
+        /// <summary>What the host readiness check reports; null for a target that reports none.</summary>
+        public TargetHostReadiness? Host { get; set; }
+
+        /// <summary>When set, the inspect-only attach fails with this error.</summary>
+        public ExecutionTargetErrorInfo? AttachError { get; set; }
+
+        public Task<TargetHostReadiness?> DescribeHostAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(Host);
 
         public List<GuestExecRequest> Requests { get; } = [];
 
@@ -1160,6 +1369,8 @@ public partial class TargetCaptureCommandTests
         /// <summary>Whether the running target's agent answers an inspect-only attach.</summary>
         public bool AgentAnswers { get; set; } = true;
 
+        public bool ReportsManagedRoot { get; set; } = true;
+
         /// <summary>The host end of the last channel handed out, so a test can watch it close.</summary>
         public IGuestTransport? LastHostTransport { get; private set; }
 
@@ -1177,6 +1388,11 @@ public partial class TargetCaptureCommandTests
         public Task<TargetAttachment> TryAttachAsync(CancellationToken cancellationToken)
         {
             AttachCalls++;
+
+            if (AttachError is { } attachError)
+            {
+                throw new ExecutionTargetException(attachError);
+            }
 
             if (!Running)
             {
@@ -1201,7 +1417,7 @@ public partial class TargetCaptureCommandTests
                 new ScriptedGuestWinapp(harness, stdout, exitCode, request => Requests.Add(request)),
                 new StaticGuestSessionProbe(new GuestSessionInfo(1, "WinSta0", HasInputDesktop: true)),
                 new GuestAgentIdentity("1.0.0", "hash", "arm64", 1, 1),
-                files: new GuestFileService(harness.GuestManaged),
+                files: ReportsManagedRoot ? new GuestFileService(harness.GuestManaged) : null,
                 guestWinapp: @"C:\WinAppGuest\winapp.exe",
                 appLauncher: appLauncher);
 
@@ -1228,6 +1444,8 @@ public partial class TargetCaptureCommandTests
 
         public bool Minimized { get; set; }
 
+        public Func<TargetDesktopSurface>? InspectSurface { get; set; }
+
         public List<TargetDesktopUse> ResolvedUses { get; } = [];
 
         public TargetDesktopSurface ResolveDesktopSurface(TargetDesktopUse use)
@@ -1240,7 +1458,7 @@ public partial class TargetCaptureCommandTests
         public TargetDesktopSurface InspectDesktopSurface()
         {
             InspectSurfaceCalls++;
-            return Surface();
+            return InspectSurface?.Invoke() ?? Surface();
         }
 
         private TargetDesktopSurface Surface() =>

@@ -12,7 +12,11 @@ public class FakeUiAutomationService : IUiAutomation
     public UiElement[] InspectResult { get; set; } = [];
     public UiElement[] SearchResult { get; set; } = [];
     public UiElement? FindSingleResult { get; set; }
+    public Exception? FindUniqueThrow { get; set; }
+    public List<bool> FindSingleRequireUniqueCalls { get; } = [];
     public List<UiSelector> Queries { get; } = [];
+    public List<UiTarget> QueryTargets { get; } = [];
+    public Action? OnFindSingle { get; set; }
 
     /// <summary>
     /// Optional per-call results for <see cref="FindSingleElementAsync"/>. When non-empty, the first
@@ -35,6 +39,16 @@ public class FakeUiAutomationService : IUiAutomation
     private readonly Dictionary<string, UiElement?> _lastMoving = new();
     public Dictionary<string, object?> PropertiesResult { get; set; } = [];
     public string InvokeResult { get; set; } = "InvokePattern";
+    /// <summary>Optional explicit-action response; otherwise defaults to the requested action's matching pattern.</summary>
+    public UiInvokeActionResult? ExplicitInvokeResult { get; set; }
+    /// <summary>Failure for explicit actions only, independent of the legacy invoke failure knobs.</summary>
+    public Exception? ExplicitInvokeThrow { get; set; }
+    /// <summary>The last explicit action requested, or null after a legacy invoke call.</summary>
+    public UiInvokeAction? LastInvokeAction { get; private set; }
+    /// <summary>Explicit-action calls, including configured failures but excluding invalid/canceled requests.</summary>
+    public int ExplicitInvokeCalls { get; private set; }
+    /// <summary>Legacy automatic invoke calls, including configured failures and ancestor retries.</summary>
+    public int AutomaticInvokeCalls { get; private set; }
     public (byte[] Pixels, int Width, int Height) ScreenshotResult { get; set; } = (new byte[4], 1, 1);
 
     /// <summary>
@@ -145,9 +159,24 @@ public class FakeUiAutomationService : IUiAutomation
         return Task.FromResult(SearchResult.Take(maxResults).ToArray());
     }
 
+    public Task<UiElement?> FindSingleElementAsync(UiTarget uiTarget, UiSelector selector, bool requireUnique, CancellationToken ct)
+    {
+        FindSingleRequireUniqueCalls.Add(requireUnique);
+        if (requireUnique && FindUniqueThrow is not null) { throw FindUniqueThrow; }
+        return FindSingleElementAsync(uiTarget, selector, ct);
+    }
+
+    public bool IsSameElement(UiElement selected, UiElement current, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        return ReferenceEquals(selected, current);
+    }
+
     public Task<UiElement?> FindSingleElementAsync(UiTarget uiTarget, UiSelector selector, CancellationToken ct)
     {
+        OnFindSingle?.Invoke();
         Queries.Add(selector);
+        QueryTargets.Add(uiTarget);
         if (FindSingleElementThrowException is not null) { throw FindSingleElementThrowException; }
         if (FindSingleThrow is not null) { throw FindSingleThrow; }
         if (FindSingleThrowCount > 0)
@@ -187,8 +216,11 @@ public class FakeUiAutomationService : IUiAutomation
     {
         if (ReadFailures.TryDequeue(out var failure)) { throw failure; }
         if (PropertiesThrow is not null) { throw PropertiesThrow; }
+        OnGetProperties?.Invoke(element, propertyName);
         return Task.FromResult(PropertiesResult);
     }
+
+    public Action<UiElement, string?>? OnGetProperties { get; set; }
 
     public Task<(byte[] Pixels, int Width, int Height)> ScreenshotAsync(UiTarget uiTarget, string? elementId, bool captureScreen, bool focus, CancellationToken ct)
     {
@@ -218,6 +250,8 @@ public class FakeUiAutomationService : IUiAutomation
 
     public Task<string> InvokeAsync(UiTarget uiTarget, UiElement element, CancellationToken ct)
     {
+        AutomaticInvokeCalls++;
+        LastInvokeAction = null;
         if (InvokeThrow is not null) { throw InvokeThrow; }
         if (InvokeThrowsForAncestorFallback && element.InvokableAncestor is not null)
         {
@@ -225,6 +259,25 @@ public class FakeUiAutomationService : IUiAutomation
         }
         LastInvokedElement = element;
         return Task.FromResult(InvokeResult);
+    }
+
+    public Task<UiInvokeActionResult> InvokeAsync(UiTarget uiTarget, UiElement element, UiInvokeAction action, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var result = action switch
+        {
+            UiInvokeAction.Invoke => new UiInvokeActionResult("InvokePattern", "invoke"),
+            UiInvokeAction.Select => new UiInvokeActionResult("SelectionItemPattern", "select"),
+            UiInvokeAction.Toggle or UiInvokeAction.ToggleOn or UiInvokeAction.ToggleOff => new UiInvokeActionResult("TogglePattern", "toggle"),
+            UiInvokeAction.Expand => new UiInvokeActionResult("ExpandCollapsePattern", "expand"),
+            UiInvokeAction.Collapse => new UiInvokeActionResult("ExpandCollapsePattern", "collapse"),
+            _ => throw new ArgumentOutOfRangeException(nameof(action), action, "Unknown UI invoke action."),
+        };
+        LastInvokeAction = action;
+        LastInvokedElement = element;
+        ExplicitInvokeCalls++;
+        if (ExplicitInvokeThrow is not null) { throw ExplicitInvokeThrow; }
+        return Task.FromResult(ExplicitInvokeResult ?? result);
     }
 
     /// <summary>Last element passed to <see cref="InvokeAsync"/>.</summary>
@@ -413,6 +466,7 @@ public class FakeKeyboardInput : IKeyboardInput
 /// </summary>
 public class FakeForegroundGuard : IForegroundGuard
 {
+    public Func<long, ForegroundCheck>? CheckResult { get; set; }
     public record EnsureCall(long TargetHwnd);
 
     public List<EnsureCall> Calls { get; } = [];
@@ -436,6 +490,7 @@ public class FakeForegroundGuard : IForegroundGuard
     public ForegroundCheck CheckForeground(long targetHwnd)
     {
         Calls.Add(new(targetHwnd));
+        if (CheckResult is not null) { return CheckResult(targetHwnd); }
 
         var deny = DenyOnCallNumber is int n ? Calls.Count == n : !Allow;
         return deny ? DenyReason : ForegroundCheck.Proceed;
@@ -525,7 +580,11 @@ public sealed class FakeSystemUiQuery : ISystemUiQuery
     public uint GetProcessIdForWindow(long hwnd)
         => ProcessIdByHwnd.TryGetValue(hwnd, out var pid) ? pid : ProcessIdForWindowResult;
 
-    public string? GetWindowText(long hwnd) => WindowTextResult;
+    /// <summary>Per-HWND titles for <see cref="GetWindowText"/>; unmapped handles fall back to <see cref="WindowTextResult"/>.</summary>
+    public Dictionary<long, string?> WindowTextByHwnd { get; } = [];
+
+    public string? GetWindowText(long hwnd)
+        => WindowTextByHwnd.TryGetValue(hwnd, out var text) ? text : WindowTextResult;
 
     public (int Width, int Height) GetWindowSize(long hwnd)
         => WindowSizeByHwnd.TryGetValue(hwnd, out var size) ? size : (0, 0);
@@ -541,6 +600,16 @@ public sealed class FakeSystemUiQuery : ISystemUiQuery
 
     public long GetRootWindow(long hwnd)
         => RootWindowByHwnd.TryGetValue(hwnd, out var root) ? root : hwnd;
+
+    /// <summary>Per-PID ApplicationFrameHost frames for <see cref="FindHostedAppFrames"/>. Unmapped PIDs host none.</summary>
+    public Dictionary<int, List<long>> HostedFramesByPid { get; } = [];
+
+    /// <summary>Per-PID exceptions thrown by <see cref="FindHostedAppFrames"/>, such as an ambiguous minimized frame.</summary>
+    public Dictionary<int, Exception> HostedFramesErrorByPid { get; } = [];
+
+    public IReadOnlyList<long> FindHostedAppFrames(int pid)
+        => HostedFramesErrorByPid.TryGetValue(pid, out var error) ? throw error
+            : HostedFramesByPid.TryGetValue(pid, out var frames) ? frames : [];
 }
 
 /// <summary>
@@ -552,10 +621,14 @@ public sealed class FakePollDelay : IPollDelay
 {
     /// <summary>Number of inter-poll delays awaited — one per "condition not met, keep polling" iteration.</summary>
     public int CallCount { get; private set; }
+    public List<int> RequestedDelays { get; } = [];
+    public Action? OnDelay { get; set; }
 
     public Task DelayAsync(int milliseconds, CancellationToken ct)
     {
         CallCount++;
+        RequestedDelays.Add(milliseconds);
+        OnDelay?.Invoke();
         return Task.Delay(1, ct);
     }
 }

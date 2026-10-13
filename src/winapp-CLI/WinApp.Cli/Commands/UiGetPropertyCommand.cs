@@ -14,12 +14,19 @@ using WinApp.Cli.Services.InteractiveDesktop;
 
 namespace WinApp.Cli.Commands;
 
-internal class UiGetPropertyCommand : Command, IShortDescription
+internal class UiGetPropertyCommand : Command, IShortDescription, IHelpExamples
 {
-    public string ShortDescription => "Read property values from an element";
+    public string ShortDescription => "Read UIA properties from an element";
+
+    public IReadOnlyList<string> Examples { get; } =
+    [
+        "winapp ui get-property <selector> -a <app> --property IsEnabled",
+        "winapp ui get-property \"Save\" --type Button -a <app>",
+    ];
 
     public UiGetPropertyCommand()
-        : base("get-property", "Read UIA property values from an element. Specify --property for a single property or omit for all.")
+        : base("get-property", "Read UIA properties from an element. Specify --property for a single property or omit for all. " +
+            "Includes whole-document TextPattern formatting: FontWeight, FontName, FontSize, ForegroundColor, IsItalic, StrikethroughStyle.")
     {
         Arguments.Add(SharedUiOptions.SelectorArgument);
         Options.Add(SharedUiOptions.AppOption);
@@ -62,6 +69,16 @@ internal class UiGetPropertyCommand : Command, IShortDescription
                 return 1;
             }
 
+            var propertyName = parseResult.GetValue(SharedUiOptions.PropertyOption);
+            if (propertyName is not null && !UiPropertyNames.IsSupported(propertyName))
+            {
+                var message = $"Unknown property '{propertyName}'. Property names are case-sensitive. Omit --property to list all properties.";
+                logger.LogError("{Message}", message);
+                UiJsonError.Emit(json, UiJsonError.CodeInvalidArguments, message,
+                    errorOut: parseResult.InvocationConfiguration.Error);
+                return 1;
+            }
+
             return UiQueryOptions.Validate(parseResult, logger, json);
         }
 
@@ -82,7 +99,7 @@ internal class UiGetPropertyCommand : Command, IShortDescription
 
                 if (element is null)
                 {
-                    UiErrors.ElementNotFound(logger, selectorStr, json);
+                    UiErrors.ElementNotFound(logger, selectorStr, json, target: uiTarget);
                     return 1;
                 }
 
@@ -131,12 +148,12 @@ internal class UiGetPropertyCommand : Command, IShortDescription
             catch (System.Runtime.InteropServices.COMException comEx)
             {
                 logger.LogDebug("COM error: {HResult} {StackTrace}", comEx.HResult, comEx.StackTrace);
-                UiErrors.StaleElement(logger, json);
+                UiErrors.StaleElement(logger, json, parseResult.InvocationConfiguration.Error);
                 return 1;
             }
             catch (Exception ex) when (!UiCoordinatedAction.IsCoordinationFault(ex))
             {
-                UiErrors.GenericError(logger, ex, json);
+                UiErrors.GenericError(logger, ex, json, parseResult.InvocationConfiguration.Error);
                 return 1;
             }
         }

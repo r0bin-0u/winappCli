@@ -3,6 +3,7 @@
 
 using Microsoft.Extensions.DependencyInjection;
 using WinApp.Cli.Commands;
+using WinApp.Cli.Helpers;
 using WinApp.Cli.Models;
 using WinApp.Cli.Services;
 
@@ -118,6 +119,27 @@ public class RunCommandProjectModeTests : BaseCommandTests
             new ProjectRunResolution(csproj, targetDir.FullName, null, ProjectPackaging.Packaged, false, arch), 0);
     }
 
+    private void SetPackagedAotOutcome(
+        FileInfo csproj,
+        DirectoryInfo publishDirectory,
+        FileInfo manifest,
+        FileInfo? recipe,
+        string arch = "x64")
+    {
+        _fakeProjectRunService.AotOutcome = new ProjectBuildOutcome(
+            new ProjectRunResolution(
+                csproj,
+                publishDirectory.FullName,
+                Path.Join(publishDirectory.FullName, "App.exe"),
+                ProjectPackaging.Packaged,
+                SelfContained: true,
+                Architecture: arch,
+                IsAot: true,
+                AppxManifestPath: manifest.FullName,
+                AppxRecipePath: recipe?.FullName),
+            0);
+    }
+
     #region Unpackaged
 
     [TestMethod]
@@ -152,6 +174,7 @@ public class RunCommandProjectModeTests : BaseCommandTests
         var csproj = CreateCsproj();
         var targetDir = CreateTargetDir(withManifest: false);
         SetUnpackagedOutcome(csproj, targetDir, selfContained: false, arch: "arm64");
+        GetRequiredService<RunCommand.Handler>().OsArchitecture = () => System.Runtime.InteropServices.Architecture.Arm64;
         var command = GetRequiredService<RunCommand>();
 
         var exitCode = await ParseAndInvokeWithCaptureAsync(command, [csproj.FullName, "--arch", "arm64", "--detach"]);
@@ -217,6 +240,68 @@ public class RunCommandProjectModeTests : BaseCommandTests
     }
 
     [TestMethod]
+    [DataRow(-1073741189, "0xC000027B")]
+    [DataRow(42, "42")]
+    public async Task ProjectMode_Unpackaged_NonZeroExit_SuggestsDebugOutput(int appExitCode, string expectedCode)
+    {
+        var csproj = CreateCsproj();
+        var targetDir = CreateTargetDir(withManifest: false);
+        SetUnpackagedOutcome(csproj, targetDir, selfContained: true);
+        _fakeAppLauncherService.FakeExitCode = appExitCode;
+        TestAnsiConsole.Profile.Width = 1000;
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(command, [csproj.FullName]);
+
+        Assert.AreEqual(appExitCode, exitCode);
+        StringAssert.Contains(TestAnsiConsole.Output, $"App exited with code {expectedCode}. Rerun with --debug-output for exception details.");
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_Unpackaged_ZeroExit_DoesNotSuggestDebugOutput()
+    {
+        var csproj = CreateCsproj();
+        var targetDir = CreateTargetDir(withManifest: false);
+        SetUnpackagedOutcome(csproj, targetDir, selfContained: true);
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(command, [csproj.FullName]);
+
+        Assert.AreEqual(0, exitCode);
+        Assert.IsFalse(TestAnsiConsole.Output.Contains("--debug-output"), "No hint for a successful exit");
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_Unpackaged_NonZeroExitWithDebugOutput_DoesNotSuggestDebugOutput()
+    {
+        var csproj = CreateCsproj();
+        var targetDir = CreateTargetDir(withManifest: false);
+        SetUnpackagedOutcome(csproj, targetDir, selfContained: true);
+        _fakeDebugOutputService.FakeExitCode = 42;
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(command, [csproj.FullName, "--debug-output"]);
+
+        Assert.AreEqual(42, exitCode);
+        Assert.IsFalse(TestAnsiConsole.Output.Contains("Rerun with --debug-output"), "No rerun hint when --debug-output is already on");
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_Unpackaged_NonZeroExitWithJson_DoesNotSuggestDebugOutput()
+    {
+        var csproj = CreateCsproj();
+        var targetDir = CreateTargetDir(withManifest: false);
+        SetUnpackagedOutcome(csproj, targetDir, selfContained: true);
+        _fakeAppLauncherService.FakeExitCode = 42;
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(command, [csproj.FullName, "--json"]);
+
+        Assert.AreEqual(42, exitCode);
+        Assert.IsFalse(TestAnsiConsole.Output.Contains("Rerun with --debug-output"), "JSON output must stay machine-readable");
+    }
+
+    [TestMethod]
     public async Task ProjectMode_Unpackaged_RuntimePrepFailure_AbortsWithoutLaunching()
     {
         // Spec R2-M2: when runtime preparation throws (e.g. the version-specific gate can't confirm the
@@ -243,6 +328,7 @@ public class RunCommandProjectModeTests : BaseCommandTests
     [DataRow("--manifest", "MANIFEST")]
     [DataRow("--output-appx-directory", "OUTDIR")]
     [DataRow("--executable", "Other.exe")]
+    [DataRow("--unique-identity", null)]
     public async Task ProjectMode_Unpackaged_RejectsEveryPackagedOnlyOption_AtAuthoritativeGate(string option, string? argToken)
     {
         // M7: every launch/identity option that is only meaningful for a packaged (MSIX) app must be
@@ -414,6 +500,22 @@ public class RunCommandProjectModeTests : BaseCommandTests
     }
 
     [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task ProjectMode_Packaged_DerivesUniqueIdentityFromTheProjectFile(bool unique)
+    {
+        var csproj = CreateCsproj();
+        var targetDir = CreateTargetDir(withManifest: true);
+        SetPackagedOutcome(csproj, targetDir, arch: "x64");
+        var command = GetRequiredService<RunCommand>();
+
+        string[] args = unique ? [csproj.FullName, "--detach", "--unique-identity"] : [csproj.FullName, "--detach"];
+        var exitCode = await ParseAndInvokeWithCaptureAsync(command, args);
+
+        Assert.AreEqual(0, exitCode);
+        Assert.AreEqual(new DevelopmentIdentityOptions(csproj.FullName, unique), _fakeMsixService.DevelopmentIdentityCalls.Single());
+    }
+    [TestMethod]
     public async Task ProjectMode_Packaged_ThreadsResolvedFrameworkIntoRuntimeProvisioning()
     {
         // M2: for a multi-targeted packaged app the resolved TFM must reach loose-layout runtime
@@ -519,6 +621,7 @@ public class RunCommandProjectModeTests : BaseCommandTests
             new ProjectRunResolution(csproj, targetDir.FullName, null, ProjectPackaging.Packaged, false, "arm64",
                 null, false, null, "WinExe", null, assetsFile),
             0);
+        GetRequiredService<RunCommand.Handler>().OsArchitecture = () => System.Runtime.InteropServices.Architecture.Arm64;
         var command = GetRequiredService<RunCommand>();
 
         await ParseAndInvokeWithCaptureAsync(command, [csproj.FullName, "-c", "Release", "--arch", "arm64"]);
@@ -598,11 +701,118 @@ public class RunCommandProjectModeTests : BaseCommandTests
     }
 
     [TestMethod]
+    public async Task FolderMode_CppLibraryOnlyFolder_ExplainsUnlessAManifestIsGiven()
+    {
+        var withoutManifestDir = _tempDirectory.CreateSubdirectory("LibA");
+        var withManifestDir = _tempDirectory.CreateSubdirectory("LibB");
+        const string library = "<Project><PropertyGroup><ConfigurationType>DynamicLibrary</ConfigurationType></PropertyGroup></Project>";
+        File.WriteAllText(Path.Join(withoutManifestDir.FullName, "LibA.vcxproj"), library);
+        File.WriteAllText(Path.Join(withManifestDir.FullName, "LibB.vcxproj"), library);
+        var manifestPath = Path.Join(_tempDirectory.CreateSubdirectory("pkg").FullName, "appxmanifest.xml");
+        File.WriteAllText(manifestPath, TestManifestContent);
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(command, [withoutManifestDir.FullName]);
+        await ParseAndInvokeWithCaptureAsync(command, [withManifestDir.FullName, "--manifest", manifestPath]);
+
+        var output = $"{ConsoleStdOut}{ConsoleStdErr}{TestAnsiConsole.Output}";
+        Assert.AreEqual(1, exitCode);
+        StringAssert.Contains(output, "LibA.vcxproj in");
+        Assert.IsFalse(output.Contains("LibB.vcxproj in", StringComparison.Ordinal),
+            "with --manifest, folder mode runs as before instead of reporting the library");
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_Cpp_PlatformProperty_SelectsArchitectureWhenArchIsNotGiven()
+    {
+        var vcxproj = new FileInfo(Path.Join(_tempDirectory.FullName, "App.vcxproj"));
+        File.WriteAllText(vcxproj.FullName, "<Project />");
+        _fakeProjectRunService.InputResolutionOverride = new RunInputResolution(WinAppRunMode.Project, vcxproj, _tempDirectory);
+        SetUnpackagedOutcome(vcxproj, CreateTargetDir(withManifest: false), selfContained: false, arch: "arm64");
+        GetRequiredService<RunCommand.Handler>().OsArchitecture = () => System.Runtime.InteropServices.Architecture.Arm64;
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(command, [vcxproj.FullName, "-p", "Platform=ARM64", "--detach"]);
+
+        Assert.AreEqual(0, exitCode);
+        Assert.AreEqual("arm64", _fakeProjectRunService.BuildOptions[0].Architecture,
+            "-p Platform=ARM64 must select arm64 instead of the machine's architecture");
+    }
+
+    [TestMethod]
+    [DataRow("-p Platform=ARM64", "-p Platform=x64", DisplayName = "-p Platform")]
+    [DataRow("--arch arm64", "--arch x64", DisplayName = "--arch")]
+    [DataRow("-r win-arm64", "-r win-x64", DisplayName = "--runtime")]
+    [DataRow("--arch arm64 -p Platform=ARM64", "--arch x64 -p Platform=x64", DisplayName = "--arch with matching -p Platform")]
+    [DataRow("-r win-arm64 -p Platform=ARM64", "-r win-x64 -p Platform=x64", DisplayName = "--runtime with matching -p Platform")]
+    public async Task ProjectMode_Cpp_PlatformThisMachineCannotRun_FailsBeforeBuilding(string archArgs, string suggestion)
+    {
+        var vcxproj = new FileInfo(Path.Join(_tempDirectory.FullName, "App.vcxproj"));
+        File.WriteAllText(vcxproj.FullName, "<Project />");
+        _fakeProjectRunService.InputResolutionOverride = new RunInputResolution(WinAppRunMode.Project, vcxproj, _tempDirectory);
+        GetRequiredService<RunCommand.Handler>().OsArchitecture = () => System.Runtime.InteropServices.Architecture.X64;
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(command, [vcxproj.FullName, .. archArgs.Split(' '), "--detach"]);
+
+        Assert.AreEqual(1, exitCode);
+        Assert.AreEqual(0, _fakeProjectRunService.BuildAndResolveCalls.Count, "an app this machine can't run must not be built first");
+        StringAssert.Contains($"{ConsoleStdOut}{ConsoleStdErr}{TestAnsiConsole.Output}", $"({suggestion})",
+            "suggest changing the input that chose the architecture");
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_Cpp_PlatformThisMachineCannotRun_StillBuildsWithNoLaunch()
+    {
+        var vcxproj = new FileInfo(Path.Join(_tempDirectory.FullName, "App.vcxproj"));
+        File.WriteAllText(vcxproj.FullName, "<Project />");
+        _fakeProjectRunService.InputResolutionOverride = new RunInputResolution(WinAppRunMode.Project, vcxproj, _tempDirectory);
+        SetPackagedOutcome(vcxproj, CreateTargetDir(withManifest: true), arch: "arm64");
+        GetRequiredService<RunCommand.Handler>().OsArchitecture = () => System.Runtime.InteropServices.Architecture.X64;
+        var command = GetRequiredService<RunCommand>();
+
+        await ParseAndInvokeWithCaptureAsync(command, [vcxproj.FullName, "-p", "Platform=ARM64", "--no-launch"]);
+
+        Assert.AreEqual(1, _fakeProjectRunService.BuildAndResolveCalls.Count);
+        Assert.AreEqual("arm64", _fakeProjectRunService.BuildOptions[0].Architecture);
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_Unpackaged_ExeRequiringAdministrator_ExplainsElevation()
+    {
+        var csproj = CreateCsproj();
+        SetUnpackagedOutcome(csproj, CreateTargetDir(withManifest: false), selfContained: true);
+        _fakeAppLauncherService.LaunchExecutableThrows = new System.ComponentModel.Win32Exception(740);
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(command, [csproj.FullName, "--detach", "--json"]);
+
+        Assert.AreEqual(1, exitCode);
+        StringAssert.Contains($"{ConsoleStdOut}{ConsoleStdErr}{TestAnsiConsole.Output}", "requires administrator rights");
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_Cpp_ExplicitArch_IsNotOverriddenByPlatformProperty()
+    {
+        var vcxproj = new FileInfo(Path.Join(_tempDirectory.FullName, "App.vcxproj"));
+        File.WriteAllText(vcxproj.FullName, "<Project />");
+        _fakeProjectRunService.InputResolutionOverride = new RunInputResolution(WinAppRunMode.Project, vcxproj, _tempDirectory);
+        SetUnpackagedOutcome(vcxproj, CreateTargetDir(withManifest: false), selfContained: false, arch: "x64");
+        var command = GetRequiredService<RunCommand>();
+
+        await ParseAndInvokeWithCaptureAsync(command, [vcxproj.FullName, "--arch", "x64", "-p", "Platform=ARM64", "--detach"]);
+
+        Assert.AreEqual("x64", _fakeProjectRunService.BuildOptions[0].Architecture,
+            "an explicit --arch is kept so the service reports the conflict");
+    }
+
+    [TestMethod]
     public async Task ProjectMode_Runtime_ResolvesArchIntoBuild()
     {
         var csproj = CreateCsproj();
         var targetDir = CreateTargetDir(withManifest: false);
         SetUnpackagedOutcome(csproj, targetDir, selfContained: false, arch: "arm64");
+        GetRequiredService<RunCommand.Handler>().OsArchitecture = () => System.Runtime.InteropServices.Architecture.Arm64;
         var command = GetRequiredService<RunCommand>();
 
         var exitCode = await ParseAndInvokeWithCaptureAsync(command, [csproj.FullName, "--runtime", "win-arm64", "--detach"]);
@@ -799,6 +1009,238 @@ public class RunCommandProjectModeTests : BaseCommandTests
             || TestAnsiConsole.Output.Contains("w0rd", StringComparison.Ordinal),
             "the validation error must not echo any part of a possible secret value");
         StringAssert.Contains(TestAnsiConsole.Output, "cannot pack multiple properties");
+    }
+
+    #endregion
+
+    #region Native AOT
+
+    [TestMethod]
+    public async Task ProjectMode_AotUsesPublishResolverAndExplicitRecipe()
+    {
+        var csproj = CreateCsproj();
+        var publishDirectory = CreateTargetDir(withManifest: false);
+        File.WriteAllText(
+            Path.Join(publishDirectory.FullName, "Package.appxmanifest"),
+            TestManifestContent.Replace("TestPackage", "StalePackage", StringComparison.Ordinal));
+        var generatedDirectory = _tempDirectory.CreateSubdirectory("generated");
+        var manifest = new FileInfo(Path.Join(generatedDirectory.FullName, "AppxManifest.xml"));
+        File.WriteAllText(manifest.FullName, TestManifestContent);
+        var recipe = new FileInfo(Path.Join(generatedDirectory.FullName, "App.build.appxrecipe"));
+        File.WriteAllText(recipe.FullName, "<Project />");
+        SetPackagedAotOutcome(csproj, publishDirectory, manifest, recipe);
+        _fakeProjectRunService.DefinitivelyUnpackaged = true;
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(
+            command,
+            [csproj.FullName, "--aot", "--no-launch"]);
+
+        Assert.AreEqual(0, exitCode);
+        Assert.AreEqual(1, _fakeProjectRunService.AotOptions.Count);
+        Assert.AreEqual(0, _fakeProjectRunService.IsDefinitivelyUnpackagedCalls.Count);
+        Assert.AreEqual(0, _fakeProjectRunService.BuildOptions.Count);
+        Assert.AreEqual("Debug", _fakeProjectRunService.AotOptions.Single().Configuration);
+        Assert.AreEqual(
+            RunArchHelper.DefaultArchitecture(),
+            _fakeProjectRunService.AotOptions.Single().Architecture);
+        Assert.AreEqual(manifest.FullName, _fakeMsixService.AddLooseLayoutCalls.Single().ManifestPath);
+        Assert.AreEqual(recipe.FullName, _fakeMsixService.AddLooseLayoutRecipeCalls.Single());
+        Assert.AreEqual(publishDirectory.FullName, _fakeMsixService.AddLooseLayoutDirectoryCalls.Single().InputDirectory);
+        Assert.AreEqual(
+            Path.Join(publishDirectory.FullName, "AppX"),
+            _fakeMsixService.AddLooseLayoutDirectoryCalls.Single().OutputDirectory);
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_AotUnpackagedRejectsIdentityOptionsAfterPublishing()
+    {
+        var csproj = CreateCsproj();
+        var publishDirectory = CreateTargetDir(withManifest: false);
+        _fakeProjectRunService.DefinitivelyUnpackaged = true;
+        _fakeProjectRunService.AotOutcome = new ProjectBuildOutcome(
+            new ProjectRunResolution(
+                csproj,
+                publishDirectory.FullName,
+                Path.Join(publishDirectory.FullName, "App.exe"),
+                ProjectPackaging.Unpackaged,
+                SelfContained: true,
+                Architecture: "x64",
+                IsAot: true),
+            0);
+        GetRequiredService<RunCommand.Handler>().OsArchitecture = () => System.Runtime.InteropServices.Architecture.Arm64;
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(
+            command, [csproj.FullName, "--aot", "--no-launch", "--json"]);
+
+        Assert.AreEqual(1, exitCode);
+        Assert.AreEqual(1, _fakeProjectRunService.AotOptions.Count);
+        Assert.AreEqual(0, _fakeProjectRunService.IsDefinitivelyUnpackagedCalls.Count);
+        Assert.AreEqual(0, _fakeMsixService.AddLooseLayoutCalls.Count);
+        Assert.AreEqual(0, _fakeAppLauncherService.LaunchExecutableCalls.Count);
+        using var output = System.Text.Json.JsonDocument.Parse(TestAnsiConsole.Output);
+        StringAssert.Contains(output.RootElement.GetProperty("Error").GetString(), "don't apply to unpackaged apps");
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_AotAuthoredManifestUsesPublishedFilesWithoutRecipe()
+    {
+        var csproj = CreateCsproj();
+        var publishDirectory = CreateTargetDir(withManifest: true);
+        var manifest = new FileInfo(Path.Join(publishDirectory.FullName, "appxmanifest.xml"));
+        SetPackagedAotOutcome(csproj, publishDirectory, manifest, recipe: null);
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(
+            command,
+            [csproj.FullName, "--aot", "--no-launch"]);
+
+        Assert.AreEqual(0, exitCode);
+        Assert.AreEqual(manifest.FullName, _fakeMsixService.AddLooseLayoutCalls.Single().ManifestPath);
+        Assert.IsNull(_fakeMsixService.AddLooseLayoutRecipeCalls.Single());
+        Assert.AreEqual(publishDirectory.FullName, _fakeMsixService.AddLooseLayoutDirectoryCalls.Single().InputDirectory);
+        Assert.AreEqual(0, _fakeAppLauncherService.LaunchExecutableCalls.Count);
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_AotForwardsConfigurationArchitectureFrameworkAndProperties()
+    {
+        var csproj = CreateCsproj();
+        var publishDirectory = CreateTargetDir(withManifest: false);
+        var exe = Path.Join(publishDirectory.FullName, "Custom.exe");
+        _fakeProjectRunService.AotOutcome = new ProjectBuildOutcome(
+            new ProjectRunResolution(
+                csproj,
+                publishDirectory.FullName,
+                exe,
+                ProjectPackaging.Unpackaged,
+                SelfContained: true,
+                Architecture: "arm64",
+                IsAot: true),
+            0);
+        GetRequiredService<RunCommand.Handler>().OsArchitecture = () => System.Runtime.InteropServices.Architecture.Arm64;
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(
+            command,
+            [
+                csproj.FullName,
+                "--aot",
+                "-c", "Release",
+                "--arch", "arm64",
+                "-f", "net10.0-windows10.0.26100.0",
+                "-p", "PublishAot=true",
+                "--no-restore",
+                "--detach",
+            ]);
+
+        Assert.AreEqual(0, exitCode);
+        var options = _fakeProjectRunService.AotOptions.Single();
+        Assert.AreEqual("Release", options.Configuration);
+        Assert.AreEqual("arm64", options.Architecture);
+        Assert.AreEqual("net10.0-windows10.0.26100.0", options.Framework);
+        Assert.IsTrue(options.NoRestore);
+        CollectionAssert.Contains(options.Properties.ToList(), "PublishAot=true");
+        Assert.AreEqual(exe, _fakeAppLauncherService.LaunchExecutableCalls.Single().ExePath);
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_AotRejectsNoBuildAndX86BeforePublishing()
+    {
+        var csproj = CreateCsproj();
+        var command = GetRequiredService<RunCommand>();
+
+        var noBuildExit = await ParseAndInvokeWithCaptureAsync(
+            command,
+            [csproj.FullName, "--aot", "--no-build"]);
+        var x86Exit = await ParseAndInvokeWithCaptureAsync(
+            command,
+            [csproj.FullName, "--aot", "--arch", "x86"]);
+
+        Assert.AreEqual(1, noBuildExit);
+        Assert.AreEqual(1, x86Exit);
+        Assert.AreEqual(0, _fakeProjectRunService.AotOptions.Count);
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_AotRuntimeArchitectureOverridesArch()
+    {
+        var csproj = CreateCsproj();
+        var publishDirectory = CreateTargetDir(withManifest: false);
+        _fakeProjectRunService.AotOutcome = new ProjectBuildOutcome(
+            new ProjectRunResolution(
+                csproj,
+                publishDirectory.FullName,
+                Path.Join(publishDirectory.FullName, "App.exe"),
+                ProjectPackaging.Unpackaged,
+                SelfContained: true,
+                Architecture: "arm64",
+                IsAot: true),
+            0);
+        GetRequiredService<RunCommand.Handler>().OsArchitecture = () => System.Runtime.InteropServices.Architecture.Arm64;
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(
+            command,
+            [
+                csproj.FullName,
+                "--aot",
+                "--arch", "x86",
+                "--runtime", "win-arm64",
+                "--detach",
+            ]);
+
+        Assert.AreEqual(0, exitCode);
+        Assert.AreEqual("arm64", _fakeProjectRunService.AotOptions.Single().Architecture);
+    }
+
+    [TestMethod]
+    public async Task AotRejectsFolderAndSingleFileModes()
+    {
+        var command = GetRequiredService<RunCommand>();
+        var singleFile = new FileInfo(Path.Join(_tempDirectory.FullName, "app.cs"));
+        File.WriteAllText(singleFile.FullName, "Console.WriteLine();");
+
+        var folderExit = await ParseAndInvokeWithCaptureAsync(
+            command,
+            [_tempDirectory.FullName, "--aot"]);
+        var singleFileExit = await ParseAndInvokeWithCaptureAsync(
+            command,
+            [singleFile.FullName, "--aot"]);
+
+        Assert.AreEqual(1, folderExit);
+        Assert.AreEqual(1, singleFileExit);
+        Assert.AreEqual(0, _fakeProjectRunService.AotOptions.Count);
+        Assert.AreEqual(0, _fakeProjectRunService.SingleFileBuildOptions.Count);
+    }
+
+    [TestMethod]
+    public async Task ProjectMode_UnpackagedAotSupportsDebugOutput()
+    {
+        var csproj = CreateCsproj();
+        var publishDirectory = CreateTargetDir(withManifest: false);
+        var exe = Path.Join(publishDirectory.FullName, "App.exe");
+        _fakeProjectRunService.AotOutcome = new ProjectBuildOutcome(
+            new ProjectRunResolution(
+                csproj,
+                publishDirectory.FullName,
+                exe,
+                ProjectPackaging.Unpackaged,
+                SelfContained: true,
+                Architecture: "x64",
+                IsAot: true),
+            0);
+        GetRequiredService<RunCommand.Handler>().OsArchitecture = () => System.Runtime.InteropServices.Architecture.Arm64;
+        var command = GetRequiredService<RunCommand>();
+
+        var exitCode = await ParseAndInvokeWithCaptureAsync(
+            command,
+            [csproj.FullName, "--aot", "--debug-output"]);
+
+        Assert.AreEqual(0, exitCode);
+        Assert.AreEqual(exe, _fakeAppLauncherService.LaunchExecutableCalls.Single().ExePath);
+        Assert.AreEqual(1, _fakeDebugOutputService.AttachCalls.Count);
     }
 
     #endregion

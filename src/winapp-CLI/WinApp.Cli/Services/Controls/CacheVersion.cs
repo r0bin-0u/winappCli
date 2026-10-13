@@ -85,6 +85,55 @@ namespace WinApp.Cli.Services.Controls;
 ///          different output. Without the bump an existing cache still matches on "21"
 ///          and keeps serving both the placeholder-bearing blocks and the broken
 ///          attributes that this change exists to remove.
+///   "23" — Samples are no longer truncated. Gallery XAML/C# and Toolkit XAML/C# were
+///          capped (2000/2500 and 1000/2500 chars) and emitted with a
+///          "&lt;!-- ...truncated --&gt;" / "// ...truncated" marker, so longer samples were
+///          unbuildable as pasted (issue #716). Toolkit's "extract just the core control
+///          element" fallback for oversized XAML is gone with it, so those samples now
+///          carry their full surrounding markup. Rule 3: same input, different output —
+///          without the bump an existing cache keeps serving the truncated snippets.
+///   "24" — Gallery is now read from the sample index WinUI-Gallery publishes
+///          (catalog/windows-samples.json) instead of being scraped, and GalleryFetcher
+///          is deleted. Upstream decides what a sample is, so the corpus is theirs
+///          rather than our reconstruction of it: samples they withhold as unpasteable
+///          are absent, and samples our extraction missed appear. Rule 3 — same source
+///          repository, different output. Scenario ids are positional over kept samples
+///          (as they have been since "16"), so a sample upstream drops renumbers the
+///          ones after it on that control's page; an unbumped cache would keep serving
+///          the old numbering against the new data. The index publishes Gallery's source
+///          verbatim, so GalleryProvider normalizes each sample for pasting the way the
+///          scraper used to — Gallery-private symbols rewritten, event handlers with no
+///          implementation dropped — which is itself Rule 3. That pass also reaches two
+///          places the scraper never did: the index's xmlnsImports field (rendered as the
+///          "Setup:" line, so a "using:WinUIGallery.ControlPages" mapping was an
+///          instruction to declare a prefix that cannot resolve) and Gallery's own package
+///          assets under Assets/SampleMedia and Assets/Tiles, which rendered as a silently
+///          blank Image or an AppWindow.SetIcon that quietly did nothing.
+///   "25" — Toolkit samples are now normalized for pasting by ToolkitProvider rather
+///          than by ToolkitFetcher, so the normalization survives deleting the scraper
+///          the way Gallery's did in "24". The move is output-preserving except for the
+///          sample class rename, which now reads the name from the C# class declaration
+///          instead of guessing it from the .xaml file-name stem. The Toolkit declares
+///          RichSuggestBoxPlainTextSample inside RichSuggestBoxPlainText.xaml.cs, so the
+///          guess missed and toolkit-richsuggestbox-2 shipped a Toolkit-internal class
+///          name instead of YourPage. Rule 3 — same input, different output. Without the
+///          bump an existing cache still matches on "24" and keeps serving that name,
+///          and the offline fallback ignores the TTL, so a filtered or offline machine
+///          would never pick up the fix.
+///   "26" — Control-level `usings` are carried on the scenario and rendered as the
+///          "Namespace:" line instead of being prepended to each sample's C#. The
+///          published code is a class-body fragment, so `using` lines glued to its
+///          front land where C# forbids them: the emitted blob failed both as its own
+///          file (CS0106) and pasted inside a class (CS1529), which between them are
+///          every placement a reader has. Rule 1 — Scenario gains a `usings` field —
+///          and Rule 3, because the same upstream sample now yields C# without the
+///          prefix. Without the bump an existing cache still matches on "25" and keeps
+///          serving the glued-on form, and the offline fallback ignores the TTL, so a
+///          filtered or offline machine would never stop pasting a snippet that cannot
+///          compile wherever it is put.
+///          This change also re-bakes the snapshot. CommunityToolkit/Windows now
+///          publishes catalog/toolkit-samples.json, so the baked corpus carries the
+///          Toolkit again instead of the reduced floor it held while that index 404'd.
 ///
 /// Note: adding the embedded snapshot floor did NOT bump this. The cached payload's
 /// schema and extraction logic are unchanged, and a bump would have forced every
@@ -92,5 +141,5 @@ namespace WinApp.Cli.Services.Controls;
 /// </summary>
 internal static class CacheVersion
 {
-    public const string Current = "22";
+    public const string Current = "26";
 }

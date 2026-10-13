@@ -14,9 +14,15 @@ using WinApp.Cli.Services.InteractiveDesktop;
 
 namespace WinApp.Cli.Commands;
 
-internal class UiListWindowsCommand : Command, IShortDescription
+internal class UiListWindowsCommand : Command, IShortDescription, IHelpExamples
 {
-    public string ShortDescription => "List all visible windows, optionally filtered by app";
+    public string ShortDescription => "List an app's windows, when -a picks the wrong one";
+
+    public IReadOnlyList<string> Examples { get; } =
+    [
+        "winapp ui list-windows -a <app>",
+        "winapp ui list-windows -a <app> --show-hidden",
+    ];
 
     public UiListWindowsCommand()
         : base("list-windows", "List all visible windows with their HWND, title, process, and size. " +
@@ -80,7 +86,7 @@ internal class UiListWindowsCommand : Command, IShortDescription
                     // Try as PID first
                     if (int.TryParse(app, out var pid))
                     {
-                        windows = uiAutomation.FindWindowsByPid(pid);
+                        windows = WindowsOrHostedFrames(pid);
                     }
                     else
                     {
@@ -91,7 +97,7 @@ internal class UiListWindowsCommand : Command, IShortDescription
                             windows = [];
                             foreach (var process in byName)
                             {
-                                windows.AddRange(uiAutomation.FindWindowsByPid(process.Id));
+                                windows.AddRange(WindowsOrHostedFrames(process.Id));
                             }
                         }
                         else
@@ -110,7 +116,7 @@ internal class UiListWindowsCommand : Command, IShortDescription
                                 windows = [];
                                 foreach (var p in partial)
                                 {
-                                    windows.AddRange(uiAutomation.FindWindowsByPid(p.Id));
+                                    windows.AddRange(WindowsOrHostedFrames(p.Id));
                                 }
                             }
                             else
@@ -126,6 +132,9 @@ internal class UiListWindowsCommand : Command, IShortDescription
                     // No filter — list ALL visible windows
                     windows = uiAutomation.FindWindowsByTitle("");
                 }
+
+                // Instances of one packaged app can report the same ApplicationFrameHost frame.
+                windows = windows.DistinctBy(w => w.Hwnd).ToList();
 
                 if (json)
                 {
@@ -187,6 +196,13 @@ internal class UiListWindowsCommand : Command, IShortDescription
                 return 1;
             }
         }
+
+        /// <summary>
+        /// The process's own top-level windows or, for a packaged app such as Calculator (which draws
+        /// inside a frame owned by ApplicationFrameHost), the frame hosting it.
+        /// </summary>
+        private List<(nint Hwnd, int Pid, string Title)> WindowsOrHostedFrames(int pid)
+            => UiTargetResolver.FindWindowsOrHostedAppFrames(uiAutomation, pid);
 
         private static string GetProcessNameSafe(int pid)
         {

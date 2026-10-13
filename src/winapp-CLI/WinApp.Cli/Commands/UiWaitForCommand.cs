@@ -15,9 +15,16 @@ using WinApp.Cli.Services.InteractiveDesktop;
 
 namespace WinApp.Cli.Commands;
 
-internal class UiWaitForCommand : Command, IShortDescription
+internal class UiWaitForCommand : Command, IShortDescription, IHelpExamples
 {
-    public string ShortDescription => "Wait for an element to appear, disappear, or change";
+    public string ShortDescription => "Wait for an element to appear, disappear, or reach a value";
+
+    public IReadOnlyList<string> Examples { get; } =
+    [
+        "winapp ui wait-for \"Saved\" -a <app>",
+        "winapp ui wait-for <selector> -a <app> --gone --timeout 10000",
+        "winapp ui wait-for <selector> -a <app> --value \"<text>\" --contains",
+    ];
 
     public static Option<bool> GoneOption { get; }
     public static Option<string?> ValueOption { get; }
@@ -42,8 +49,8 @@ internal class UiWaitForCommand : Command, IShortDescription
     }
 
     public UiWaitForCommand()
-        : base("wait-for", "Wait for an element to appear, disappear, or have a property reach a target value. " +
-               "Polls at 100ms intervals until condition met or timeout.")
+        : base("wait-for", "Wait for an element to appear, disappear, or reach a value. " +
+               "Polls every 100 ms until the condition is met or the timeout expires.")
     {
         Arguments.Add(SharedUiOptions.SelectorArgument);
         Options.Add(SharedUiOptions.AppOption);
@@ -91,6 +98,16 @@ internal class UiWaitForCommand : Command, IShortDescription
             if (string.IsNullOrWhiteSpace(selectorStr))
             {
                 UiErrors.MissingSelector(logger, "wait-for", json);
+                return 1;
+            }
+
+            var propertyName = parseResult.GetValue(SharedUiOptions.PropertyOption);
+            if (propertyName is not null && !UiPropertyNames.IsSupported(propertyName))
+            {
+                var message = $"Unknown property '{propertyName}'. Property names are case-sensitive. Omit --property from get-property to list all properties.";
+                logger.LogError("{Message}", message);
+                UiJsonError.Emit(json, UiJsonError.CodeInvalidArguments, message,
+                    errorOut: parseResult.InvocationConfiguration.Error);
                 return 1;
             }
 

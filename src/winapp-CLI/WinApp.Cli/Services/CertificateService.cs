@@ -18,6 +18,30 @@ internal partial class CertificateService(
 {
     public const string DefaultCertFileName = "devcert.pfx";
 
+    /// <summary>
+    /// PFX password used when the caller does not supply one. Publicly known by design: the
+    /// certificate it protects is only ever meant to sign local test builds.
+    /// </summary>
+    public const string DefaultCertPassword = "password";
+
+    /// <summary>
+    /// Security disclosure that must accompany any certificate protected by <see cref="DefaultCertPassword"/>.
+    /// Plain text with no <see cref="UiSymbols"/> prefix so it is equally usable in console output
+    /// and in <c>--json</c> payloads; callers add their own presentation.
+    /// </summary>
+    public const string DefaultPasswordDisclosure =
+        "Protected with the default password ('" + DefaultCertPassword + "'), which is public. " +
+        "Treat this certificate as development-only: anyone who obtains the .pfx can sign as you. " +
+        "Pass --password to choose your own, and use a CA-issued certificate or Azure Trusted Signing to ship.";
+
+    /// <summary>
+    /// Whether a certificate protected by <paramref name="password"/> needs the public-password
+    /// disclosure. Deliberately compares the value rather than asking whether the user passed
+    /// <c>--password</c>: an explicit <c>--password password</c> is exactly as public as the default.
+    /// </summary>
+    public static bool UsesDefaultPassword(string? password) =>
+        string.Equals(password, DefaultCertPassword, StringComparison.Ordinal);
+
     // Test seams for OS/certificate-store boundaries. Each defaults to the real
     // production implementation; tests inject fakes to exercise success/error paths
     // that require administrator privileges or a matching machine-store certificate.
@@ -32,6 +56,11 @@ internal partial class CertificateService(
     // key container behind on the host; production always uses the persisting default.
     internal X509KeyStorageFlags InstallKeyStorageFlags { get; set; } =
         X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.PersistKeySet;
+
+    // Whether GenerateDevCertificateAsync persists its private key and adds the certificate to
+    // CurrentUser\My. Production always does; tests turn it off so the generated key is ephemeral
+    // and a test run leaves nothing behind in the user's certificate store or key containers.
+    internal bool PersistToCurrentUserStore { get; set; } = true;
 
     public record CertificateResult(
         FileInfo CertificatePath,
@@ -57,9 +86,13 @@ internal partial class CertificateService(
         // Normalize the publisher to a valid X.500 distinguished name.
         var subjectName = PublisherDnHelper.Normalize(publisher);
 
+        CngKey? cngKey = null;
+        string? storedThumbprint = null;
+        var outputs = new List<StagedOutput>();
         try
         {
-            // 1) Create a persisted CNG key in MS Software KSP with AllowExport
+            // 1) Create a CNG key in MS Software KSP with AllowExport. It is persisted (named) only
+            // when the certificate will be added to CurrentUser\My, which needs the key container.
             var creationParams = new CngKeyCreationParameters
             {
                 Provider = CngProvider.MicrosoftSoftwareKeyStorageProvider,
@@ -70,7 +103,8 @@ internal partial class CertificateService(
             // Set length = 2048
             creationParams.Parameters.Add(new CngProperty("Length", BitConverter.GetBytes(2048), CngPropertyOptions.None));
 
-            using var cngKey = CngKey.Create(CngAlgorithm.Rsa, $"MSIXDev-{Guid.NewGuid()}", creationParams);
+            var keyName = PersistToCurrentUserStore ? $"MSIXDev-{Guid.NewGuid()}" : null;
+            cngKey = CngKey.Create(CngAlgorithm.Rsa, keyName, creationParams);
             using var rsa = new RSACng(cngKey);
 
             // 2) Build req to mirror PS flags
@@ -86,26 +120,55 @@ internal partial class CertificateService(
             using var cert = req.CreateSelfSigned(notBefore, notAfter);
             cert.FriendlyName = "MSIX Dev Certificate";
 
-            using (var store = new X509Store(StoreName.My, StoreLocation.CurrentUser))
-            {
-                store.Open(OpenFlags.ReadWrite);
-                store.Add(cert);
-            }
+            // Stage every output next to its target first, so a failure never leaves a store entry
+            // without its files and never loses or mismatches files the user already had.
+            var pfxOutput = new StagedOutput(outputPath.FullName);
+            outputs.Add(pfxOutput);
+            await File.WriteAllBytesAsync(pfxOutput.Staged, cert.Export(X509ContentType.Pfx, password), cancellationToken);
 
-            var pfx = cert.Export(X509ContentType.Pfx, password);
-            await File.WriteAllBytesAsync(outputPath.FullName, pfx, cancellationToken);
-
-            taskContext.AddDebugMessage($"Certificate generated: {outputPath}");
-
-            // Export public certificate (.cer) if requested
             FileInfo? publicCertPath = null;
             if (exportCer)
             {
-                var cerPath = Path.ChangeExtension(outputPath.FullName, ".cer");
-                var cerBytes = cert.Export(X509ContentType.Cert);
-                await File.WriteAllBytesAsync(cerPath, cerBytes, cancellationToken);
-                publicCertPath = new FileInfo(cerPath);
-                taskContext.AddDebugMessage($"Public certificate exported: {cerPath}");
+                var cerOutput = new StagedOutput(Path.ChangeExtension(outputPath.FullName, ".cer"));
+                outputs.Add(cerOutput);
+                await File.WriteAllBytesAsync(cerOutput.Staged, cert.Export(X509ContentType.Cert), cancellationToken);
+                publicCertPath = new FileInfo(cerOutput.Target);
+            }
+
+            if (PersistToCurrentUserStore)
+            {
+                using var store = new X509Store(StoreName.My, StoreLocation.CurrentUser);
+                store.Open(OpenFlags.ReadWrite);
+                store.Add(cert);
+                storedThumbprint = cert.Thumbprint;
+            }
+
+            // Replace existing files with File.Replace: it swaps in one step, keeps the existing file's
+            // ACL (a PFX may be locked down beyond its directory's defaults), and keeps the original
+            // under the backup name so rollback can restore it.
+            foreach (var output in outputs)
+            {
+                if (File.Exists(output.Target))
+                {
+                    output.Backup = StagingPathFor(output.Target);
+                    File.Replace(output.Staged, output.Target, output.Backup);
+                }
+                else
+                {
+                    File.Move(output.Staged, output.Target);
+                }
+                output.Committed = true;
+            }
+
+            foreach (var output in outputs.Where(o => o.Backup != null))
+            {
+                TryDelete(output.Backup!, taskContext);
+            }
+
+            taskContext.AddDebugMessage($"Certificate generated: {outputPath}");
+            if (publicCertPath != null)
+            {
+                taskContext.AddDebugMessage($"Public certificate exported: {publicCertPath}");
             }
 
             outputPath.Refresh();
@@ -123,7 +186,97 @@ internal partial class CertificateService(
         }
         catch (Exception error)
         {
+            RollBackFailedGeneration(cngKey, storedThumbprint, outputs, taskContext);
             throw new InvalidOperationException($"Failed to generate development certificate: {error.Message}", error);
+        }
+        finally
+        {
+            cngKey?.Dispose();
+        }
+    }
+
+    private static string StagingPathFor(string target) => $"{target}.{Guid.NewGuid():N}.tmp";
+
+    private sealed class StagedOutput(string target)
+    {
+        public string Target { get; } = target;
+        public string Staged { get; } = StagingPathFor(target);
+        public string? Backup { get; set; }
+        public bool Committed { get; set; }
+    }
+
+    private static void TryDelete(string path, TaskContext taskContext)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex)
+        {
+            taskContext.AddDebugMessage($"Could not delete '{path}': {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Best-effort cleanup after a failed generation: restores the user's previous output files and
+    /// removes the store entry, persisted key container and staged files this call created.
+    /// Never throws.
+    /// </summary>
+    private void RollBackFailedGeneration(CngKey? cngKey, string? storedThumbprint, List<StagedOutput> outputs, TaskContext taskContext)
+    {
+        for (var i = outputs.Count - 1; i >= 0; i--)
+        {
+            var output = outputs[i];
+            if (output.Committed)
+            {
+                TryDelete(output.Target, taskContext);
+            }
+            // File.Replace can fail after moving the original to its backup name, so restore whenever
+            // the backup exists, not only after a successful commit.
+            if (output.Backup != null && File.Exists(output.Backup))
+            {
+                try
+                {
+                    File.Move(output.Backup, output.Target, overwrite: true);
+                }
+                catch (Exception ex)
+                {
+                    taskContext.AddDebugMessage($"Could not restore '{output.Target}' from '{output.Backup}': {ex.Message}");
+                }
+            }
+            TryDelete(output.Staged, taskContext);
+        }
+
+        if (storedThumbprint != null)
+        {
+            try
+            {
+                using var store = new X509Store(StoreName.My, StoreLocation.CurrentUser);
+                store.Open(OpenFlags.ReadWrite);
+                foreach (var stored in store.Certificates.Find(X509FindType.FindByThumbprint, storedThumbprint, validOnly: false))
+                {
+                    using (stored)
+                    {
+                        store.Remove(stored);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                taskContext.AddDebugMessage($"Could not remove the generated certificate from the store: {ex.Message}");
+            }
+        }
+
+        if (cngKey != null && PersistToCurrentUserStore)
+        {
+            try
+            {
+                cngKey.Delete();
+            }
+            catch (Exception ex)
+            {
+                taskContext.AddDebugMessage($"Could not delete the generated key: {ex.Message}");
+            }
         }
     }
 
@@ -145,8 +298,8 @@ internal partial class CertificateService(
                 try
                 {
                     // Load the certificate to get its thumbprint/subject for comparison
-                    using var certToCheck = X509CertificateLoader.LoadPkcs12FromFile(
-                        certPath.FullName,
+                    using var certToCheck = LoadCertificate(
+                        certPath,
                         password,
                         X509KeyStorageFlags.Exportable);
 
@@ -164,12 +317,15 @@ internal partial class CertificateService(
                 }
             }
 
-            // Install to TrustedPeople store (required for MSIX sideloading)
-            // Load the certificate from the PFX file. The key-storage flags are seamed so unit
-            // tests load with EphemeralKeySet (no persisted key container); production uses the
-            // default MachineKeySet|PersistKeySet so the installed certificate stays usable.
-            using var cert = X509CertificateLoader.LoadPkcs12FromFile(
-                certPath.FullName,
+            // Install to TrustedPeople store (required for MSIX sideloading).
+            // A PFX carries a private key; a public-only .cer (e.g. one produced by
+            // `cert generate --export-cer`) is loaded as a certificate-only object. Either is
+            // valid to trust — the TrustedPeople store only needs the public certificate. The
+            // key-storage flags are seamed so unit tests load a PFX with EphemeralKeySet (no
+            // persisted key container); production uses the default MachineKeySet|PersistKeySet
+            // so an installed PFX stays usable.
+            using var cert = LoadCertificate(
+                certPath,
                 password,
                 InstallKeyStorageFlags);
 
@@ -196,6 +352,27 @@ internal partial class CertificateService(
     }
 
     /// <summary>
+    /// Loads a certificate from either a PKCS#12 (.pfx) file or a public-only DER/PEM (.cer) file.
+    /// The format is detected up front with <see cref="X509Certificate2.GetCertContentType(string)"/>
+    /// — which classifies PFX and certificate files without needing the password — so a PKCS#12
+    /// file always loads through the PFX path. A public-only .cer (e.g. one produced by
+    /// `cert generate --export-cer`) loads as a certificate-only object. Detecting rather than
+    /// catch-and-fallback keeps a genuine PFX error (such as a wrong password) as the error the
+    /// user sees instead of masking it with a certificate-decoding failure. <paramref name="pfxKeyStorageFlags"/>
+    /// applies only to the PFX path; a .cer carries no private key, so the flags and password are
+    /// ignored for it.
+    /// </summary>
+    internal static X509Certificate2 LoadCertificate(
+        FileInfo certPath,
+        string password,
+        X509KeyStorageFlags pfxKeyStorageFlags)
+    {
+        return X509Certificate2.GetCertContentType(certPath.FullName) == X509ContentType.Pfx
+            ? X509CertificateLoader.LoadPkcs12FromFile(certPath.FullName, password, pfxKeyStorageFlags)
+            : X509CertificateLoader.LoadCertificateFromFile(certPath.FullName);
+    }
+
+    /// <summary>
     /// Signs a file with a certificate.
     /// This method can be used to sign any file, including but not limited to MSIX packages.
     /// </summary>
@@ -218,19 +395,65 @@ internal partial class CertificateService(
             throw new FileNotFoundException($"Certificate file not found: {certificatePath}");
         }
 
-        var arguments = $@"sign /f ""{certificatePath}"" /p ""{password}"" /fd SHA256";
+        var tokens = new List<string> { "/fd", "SHA256" };
 
         if (!string.IsNullOrWhiteSpace(timestampUrl))
         {
-            arguments += $@" /tr ""{timestampUrl}"" /td SHA256";
+            // The timestamp URL can originate from a project's AppxPackageSigningTimestampServerUrl, so
+            // validate it as an absolute http/https URL before it reaches signtool. JoinArguments below then
+            // encodes every token so an embedded quote in any value cannot inject an extra signtool switch.
+            if (!Uri.TryCreate(timestampUrl, UriKind.Absolute, out var timestampUri)
+                || (timestampUri.Scheme != Uri.UriSchemeHttp && timestampUri.Scheme != Uri.UriSchemeHttps))
+            {
+                throw new InvalidOperationException(
+                    $"Invalid timestamp server URL '{timestampUrl}'. It must be an absolute http or https URL.");
+            }
+
+            tokens.Add("/tr");
+            tokens.Add(timestampUrl);
+            tokens.Add("/td");
+            tokens.Add("SHA256");
         }
 
-        arguments += $@" ""{filePath}""";
+        tokens.Add(filePath.FullName);
 
         taskContext.AddDebugMessage($"Signing file: {filePath}");
 
+        X509Certificate2Collection? pfxCertificates = null;
+        string? signingStorePath = null;
         try
         {
+            if (X509Certificate2.GetCertContentType(certificatePath.FullName) == X509ContentType.Pfx)
+            {
+                // Passing the PFX to signtool (/f <pfx> /p <password>) makes signtool import its key
+                // into a new container that nothing ever deletes. Import it here instead, hand signtool
+                // a serialized store that references that key (plus any bundled chain certificates),
+                // and delete the key once signing finishes.
+                try
+                {
+                    pfxCertificates = X509CertificateLoader.LoadPkcs12CollectionFromFile(
+                        certificatePath.FullName,
+                        password ?? DefaultCertPassword,
+                        X509KeyStorageFlags.UserKeySet | X509KeyStorageFlags.PersistKeySet);
+                }
+                catch (CryptographicException ex)
+                {
+                    // The published CLI strips .NET's exception text (UseSystemResourceKeys), so the
+                    // loader's own message would surface as a bare resource key.
+                    throw new InvalidOperationException(
+                        $"Could not open certificate '{certificatePath.FullName}'. Check that the password is correct.", ex);
+                }
+                signingStorePath = Path.Join(Path.GetTempPath(), $"winapp-sign-{Guid.NewGuid():N}.sst");
+                await File.WriteAllBytesAsync(signingStorePath, pfxCertificates.Export(X509ContentType.SerializedStore)!, cancellationToken);
+                tokens.InsertRange(0, ["sign", "/f", signingStorePath]);
+            }
+            else
+            {
+                tokens.InsertRange(0, ["sign", "/f", certificatePath.FullName, "/p", password ?? DefaultCertPassword]);
+            }
+
+            var arguments = WindowsCommandLine.JoinArguments(tokens) ?? string.Empty;
+
             await buildToolsService.RunBuildToolAsync(new GenericTool("signtool.exe"), arguments, taskContext, cancellationToken: cancellationToken);
 
             taskContext.AddDebugMessage("File signed successfully");
@@ -256,6 +479,69 @@ internal partial class CertificateService(
         catch (Exception ex)
         {
             throw new InvalidOperationException($"Failed to sign file: {ex.Message}", ex);
+        }
+        finally
+        {
+            if (signingStorePath != null)
+            {
+                TryDeleteFile(signingStorePath, taskContext);
+            }
+
+            if (pfxCertificates != null)
+            {
+                foreach (var certificate in pfxCertificates)
+                {
+                    try
+                    {
+                        DeletePersistedPrivateKey(certificate, taskContext);
+                    }
+                    finally
+                    {
+                        certificate.Dispose();
+                    }
+                }
+            }
+        }
+    }
+
+    private static void TryDeleteFile(string path, TaskContext taskContext)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            taskContext.AddDebugMessage($"Could not delete temporary signing file '{path}': {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Deletes the key container that loading a PFX with <see cref="X509KeyStorageFlags.PersistKeySet"/> created.
+    /// </summary>
+    internal static void DeletePersistedPrivateKey(X509Certificate2 cert, TaskContext taskContext)
+    {
+        if (!cert.HasPrivateKey)
+        {
+            return;
+        }
+
+        try
+        {
+            using AsymmetricAlgorithm? key =
+                cert.GetRSAPrivateKey() ?? (AsymmetricAlgorithm?)cert.GetECDsaPrivateKey() ?? cert.GetDSAPrivateKey();
+            switch (key)
+            {
+                case RSACng rsa: rsa.Key.Delete(); break;
+                case ECDsaCng ecdsa: ecdsa.Key.Delete(); break;
+                case DSACng dsa: dsa.Key.Delete(); break;
+                case RSACryptoServiceProvider rsaCsp: rsaCsp.PersistKeyInCsp = false; break;
+                case DSACryptoServiceProvider dsaCsp: dsaCsp.PersistKeyInCsp = false; break;
+            }
+        }
+        catch (CryptographicException ex)
+        {
+            taskContext.AddDebugMessage($"Could not delete the temporary signing key for '{cert.Subject}': {ex.Message}");
         }
     }
 
@@ -336,12 +622,9 @@ internal partial class CertificateService(
                 };
             }
 
-            if (password == "password")
+            if (UsesDefaultPassword(password))
             {
-                taskContext.AddStatusMessage(
-                    $"{UiSymbols.Warning} Protected with the default password ('password'), which is public. " +
-                    "Treat this certificate as development-only: anyone who obtains the .pfx can sign as you. " +
-                    "Pass --password to choose your own, and use a CA-issued certificate or Azure Trusted Signing to ship.");
+                taskContext.AddStatusMessage($"{UiSymbols.Warning} {DefaultPasswordDisclosure}");
             }
 
             // Install certificate if requested

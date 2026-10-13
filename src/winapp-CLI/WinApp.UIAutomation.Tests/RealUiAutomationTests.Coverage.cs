@@ -524,7 +524,7 @@ public partial class RealUiAutomationTests
         var uiTarget = SessionFor(fx);
 
         UiAutomationService.s_getFocusedElement = _ => throw new COMException("focus failed");
-        Assert.IsNull(await svc.GetFocusedElementAsync(uiTarget, CancellationToken.None));
+        await Assert.ThrowsExactlyAsync<COMException>(() => svc.GetFocusedElementAsync(uiTarget, CancellationToken.None));
 
         UiAutomationService.s_getFocusedElement = _ => null;
         Assert.IsNull(await svc.GetFocusedElementAsync(uiTarget, CancellationToken.None));
@@ -532,7 +532,7 @@ public partial class RealUiAutomationTests
         UiAutomationService.s_getFocusedElement = _ =>
             CUIAutomation8.CreateInstance<IUIAutomation>().ElementFromHandle(new HWND(fx.Hwnd));
         UiAutomationService.s_getElementProcessId = _ => throw new COMException("pid failed");
-        Assert.IsNull(await svc.GetFocusedElementAsync(uiTarget, CancellationToken.None));
+        await Assert.ThrowsExactlyAsync<COMException>(() => svc.GetFocusedElementAsync(uiTarget, CancellationToken.None));
     }
 
     [TestMethod]
@@ -558,19 +558,18 @@ public partial class RealUiAutomationTests
     [TestMethod]
     public async Task GetPropertiesAsync_PropertyNameFiltersPresentAndMissingValues()
     {
-        using var fx = new UiaTestFixture();
+        using var fx = new UiaTestFixture(nonActivating: true);
         var svc = NewService();
         var uiTarget = SessionFor(fx);
         var box = await ResolveAsync(svc, uiTarget, "txtValue");
 
         var present = await svc.GetPropertiesAsync(uiTarget, box, "Name", CancellationToken.None);
-        var missing = await svc.GetPropertiesAsync(uiTarget, box, "DefinitelyMissing", CancellationToken.None);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.GetPropertiesAsync(uiTarget, box, "DefinitelyMissing", CancellationToken.None));
 
         Assert.AreEqual(1, present.Count);
         Assert.IsTrue(present.ContainsKey("Name"));
         Assert.AreEqual("Value", present["Name"]);
-        Assert.IsTrue(missing.ContainsKey("DefinitelyMissing"));
-        Assert.IsNull(missing["DefinitelyMissing"]);
     }
 
     [TestMethod]
@@ -1009,6 +1008,11 @@ public partial class RealUiAutomationTests
 
         var target = ComProxy<IUIAutomationElement>((method, args) =>
         {
+            if (method.Name == "GetCurrentPropertyValue" &&
+                (UIA_PROPERTY_ID)args![0]! == UIA_PROPERTY_ID.UIA_IsTextPatternAvailablePropertyId)
+            {
+                return System.Runtime.InteropServices.Marshalling.ComVariant.Create(false);
+            }
             if (method.Name == "GetCurrentPattern")
             {
                 var id = (UIA_PATTERN_ID)args![0]!;
@@ -1040,6 +1044,10 @@ public partial class RealUiAutomationTests
         Assert.AreEqual("ExpandCollapsePattern", invokePattern);
         Assert.AreEqual("999", props["ToggleState"]);
         Assert.AreEqual("999", props["ExpandCollapseState"]);
+        foreach (var (name, _) in UiAutomationService.TextAttributes)
+        {
+            Assert.AreEqual("Unavailable", props[name]);
+        }
         Assert.IsTrue(logger.Has(Microsoft.Extensions.Logging.LogLevel.Warning, "Element position unchanged"));
     }
 
@@ -1213,6 +1221,136 @@ public partial class RealUiAutomationTests
     }
 
     [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task NativeSeams_ExplicitWindowGone_DoesNotFallBackToOtherWindowsOfItsProcess(bool throws)
+    {
+        // ApplicationFrameHost owns every packaged app's frame. When the selected frame closes,
+        // a PID search would bind to another app's frame (e.g. a second Calculator).
+        var svc = NewService();
+        var uiTarget = new UiTarget
+        {
+            ProcessId = Environment.ProcessId, ProcessName = "ApplicationFrameHost", WindowHandle = 456, IsExplicitWindow = true,
+        };
+        var otherFrame = ComProxy<IUIAutomationElement>((method, _) => method.Name switch
+        {
+            "get_CurrentBoundingRectangle" => new RECT { left = 1, top = 2, right = 101, bottom = 82 },
+            "get_CurrentName" => StringBstr("Other Calculator"),
+            "get_CurrentControlType" => UIA_CONTROLTYPE_ID.UIA_WindowControlTypeId,
+            "get_CurrentIsEnabled" => new BOOL(true),
+            "get_CurrentIsOffscreen" => new BOOL(false),
+            _ => ThrowCom(),
+        });
+        var one = ComProxy<IUIAutomationElementArray>((method, _) => method.Name switch
+        {
+            "get_Length" => 1,
+            "GetElement" => otherFrame,
+            _ => ThrowCom(),
+        });
+        UiAutomationService.s_elementFromHandle = (_, hwnd) => hwnd == 456 && throws ? throw new COMException("gone") : null;
+        UiAutomationService.s_getDesktopRootElement = _ =>
+            ComProxy<IUIAutomationElement>((method, _) => method.Name == "FindAll" ? one : ThrowCom());
+        UiAutomationService.s_getMainWindowHandleForProcessId = _ => 789;
+
+        var elements = await svc.InspectAsync(uiTarget, null, 0, CancellationToken.None);
+
+        Assert.AreEqual(0, elements.Length, "A closed explicit window must not resolve to another window of its process.");
+    }
+
+    [TestMethod]
+    [DataRow(false, false)]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    public async Task ConstrainedQuery_ClosedExplicitWindow_IsAbsentButOtherFailuresSurface(bool closedBeforeQuery, bool windowStillOpen)
+    {
+        // `wait-for Seven --type Button --gone -a <pid>` must report the element gone when the frame
+        // closes: either before the poll or while the query runs against the dead provider.
+        var svc = NewService();
+        var uiTarget = new UiTarget
+        {
+            ProcessId = Environment.ProcessId, ProcessName = "ApplicationFrameHost", WindowHandle = 456, IsExplicitWindow = true,
+        };
+        var windowOpen = !closedBeforeQuery;
+        var failure = new COMException("Provider is gone.", unchecked((int)0x8000FFFF));
+        var root = ComProxy<IUIAutomationElement>((method, _) =>
+        {
+            if (method.Name is "FindAll" or "FindFirst")
+            {
+                windowOpen = windowStillOpen;
+                throw failure;
+            }
+            return ThrowCom();
+        });
+        UiAutomationService.s_getRootElement = (_, _, _) => root;
+        UiAutomationService.s_elementFromHandle = (_, _) => root;
+        SystemUiQuery.s_getProcessIdForWindow = hwnd => hwnd == 456 && windowOpen ? (uint)Environment.ProcessId : 0;
+        try
+        {
+            var selector = new UiSelector { Query = "Seven", ControlType = "Button" };
+            if (windowStillOpen)
+            {
+                Assert.AreSame(failure, await Assert.ThrowsExactlyAsync<COMException>(
+                    () => svc.FindSingleElementAsync(uiTarget, selector, CancellationToken.None)));
+            }
+            else
+            {
+                Assert.IsNull(await svc.FindSingleElementAsync(uiTarget, selector, CancellationToken.None));
+            }
+        }
+        finally
+        {
+            SystemUiQuery.ResetNativeSeams();
+        }
+    }
+
+    [TestMethod]
+    [DataRow(false, true)]
+    [DataRow(true, null)]
+    public async Task FaultInjectedComProxies_EditableDoesNotDependOnReadingTheValue(bool readOnly, bool? expected)
+    {
+        var svc = NewService();
+        var uiTarget = new UiTarget { ProcessId = Environment.ProcessId, ProcessName = "fake", WindowHandle = 333 };
+        var valuePattern = ComProxy<IUIAutomationValuePattern>((method, _) => method.Name switch
+        {
+            "get_CurrentValue" => ThrowCom(),
+            "get_CurrentIsReadOnly" => new BOOL(readOnly),
+            _ => ThrowCom(),
+        });
+        var target = ComProxy<IUIAutomationElement>((method, args) =>
+        {
+            if (method.Name == "GetCurrentPattern")
+            {
+                return (UIA_PATTERN_ID)args![0]! == UIA_PATTERN_ID.UIA_ValuePatternId ? valuePattern : ThrowCom();
+            }
+            return method.Name switch
+            {
+                "get_CurrentBoundingRectangle" => new RECT { left = 1, top = 2, right = 31, bottom = 42 },
+                "get_CurrentName" => StringBstr("Editor"),
+                "get_CurrentAutomationId" => StringBstr("editorAid"),
+                "get_CurrentClassName" => EmptyBstr(),
+                "get_CurrentControlType" => UIA_CONTROLTYPE_ID.UIA_DocumentControlTypeId,
+                "get_CurrentIsEnabled" => new BOOL(true),
+                "get_CurrentIsOffscreen" => new BOOL(false),
+                _ => ThrowCom(),
+            };
+        });
+        var array = ComProxy<IUIAutomationElementArray>((method, _) => method.Name switch
+        {
+            "get_Length" => 1,
+            "GetElement" => target,
+            _ => ThrowCom(),
+        });
+        var root = ComProxy<IUIAutomationElement>((method, _) => method.Name == "FindAll" ? array : ThrowCom());
+        UiAutomationService.s_getRootElement = (_, _, _) => root;
+        UiAutomationService.s_findInvokableAncestor = (_, _, _) => null;
+
+        var result = (await svc.SearchAsync(uiTarget, new UiSelector { Query = "editorAid" }, 1, CancellationToken.None)).Single();
+
+        Assert.AreEqual(expected, result.IsEditable);
+        Assert.IsNull(result.Value);
+    }
+
+    [TestMethod]
     public async Task NativeSeams_CoverRootElementFallbacks()
     {
         var logger = new CapturingLogger<UiAutomationService>();
@@ -1354,17 +1492,29 @@ public partial class RealUiAutomationTests
     }
 
     [TestMethod]
-    public async Task FaultInjectedComProxies_CoverEmptyTextAndValueFallthrough()
+    [DataRow("", "", "", false)]
+    [DataRow("", "Lower-priority value", "", false)]
+    [DataRow(" \t\r\n", "Lower-priority value", " \t\r\n", false)]
+    [DataRow("Document text", "Lower-priority value", "Document text", false)]
+    [DataRow(null, "", "", false)]
+    [DataRow(null, " \t\r\n", " \t\r\n", false)]
+    [DataRow(null, "Field value", "Field value", false)]
+    [DataRow(null, null, "Fallback Name", false)]
+    [DataRow("", "Lower-priority value", "", true)]
+    [DataRow(null, "", "", true)]
+    public async Task FaultInjectedComProxies_GetTextPreservesSuccessfulReads(
+        string? documentText, string? fieldValue, string expected, bool nullBstr)
     {
         var svc = NewService();
         var uiTarget = new UiTarget { ProcessId = Environment.ProcessId, ProcessName = "fake" };
         var model = new UiElement { Id = "text-fallback", Type = "Custom", AutomationId = "textAid", Name = "Fallback Name" };
+        BSTR ReadValue(string value) => nullBstr && value.Length == 0 ? default : StringBstr(value);
         var textRange = ComProxy<IUIAutomationTextRange>((method, _) =>
-            method.Name == "GetText" ? EmptyBstr() : ThrowCom());
+            method.Name == "GetText" ? ReadValue(documentText!) : ThrowCom());
         var textPattern = ComProxy<IUIAutomationTextPattern>((method, _) =>
             method.Name == "get_DocumentRange" ? textRange : ThrowCom());
         var valuePattern = ComProxy<IUIAutomationValuePattern>((method, _) =>
-            method.Name == "get_CurrentValue" ? EmptyBstr() : ThrowCom());
+            method.Name == "get_CurrentValue" ? ReadValue(fieldValue!) : ThrowCom());
         var selected = ComProxy<IUIAutomationElement>((method, _) =>
             method.Name == "get_CurrentName" ? EmptyBstr() : ThrowCom());
         var selection = ComProxy<IUIAutomationElementArray>((method, _) => method.Name switch
@@ -1381,8 +1531,8 @@ public partial class RealUiAutomationTests
             {
                 return (UIA_PATTERN_ID)args![0]! switch
                 {
-                    UIA_PATTERN_ID.UIA_TextPatternId => textPattern,
-                    UIA_PATTERN_ID.UIA_ValuePatternId => valuePattern,
+                    UIA_PATTERN_ID.UIA_TextPatternId when documentText is not null => textPattern,
+                    UIA_PATTERN_ID.UIA_ValuePatternId when fieldValue is not null => valuePattern,
                     UIA_PATTERN_ID.UIA_SelectionPatternId => selectionPattern,
                     _ => ThrowCom(),
                 };
@@ -1394,7 +1544,8 @@ public partial class RealUiAutomationTests
 
         var text = await svc.GetTextAsync(uiTarget, model, CancellationToken.None);
 
-        Assert.AreEqual("Fallback Name", text);
+        Assert.AreEqual(expected, text);
+        Assert.AreEqual("Fallback Name", model.Name, "Reading a value must not change its accessibility label.");
     }
 
     [TestMethod]

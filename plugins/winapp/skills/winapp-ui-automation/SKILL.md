@@ -1,7 +1,10 @@
 ---
 name: winapp-ui-automation
-description: Inspect and interact with running Windows app UIs from the command line using UI Automation (UIA). Use when an AI agent or developer needs to inspect a UI element tree, find controls, take screenshots, click buttons, read or set text, or verify UI state in a running Windows app. Works with any framework WinUI 3, WPF, WinForms, Win32, Electron.
+description: "Inspect, drive, and verify a running Windows app UI with winapp ui (UI Automation): find elements, click, type, read text and values, wait for state, take screenshots. Works with WinUI, WPF, WinForms, Win32, and Electron. Use to check, test, or act on a live app."
 ---
+
+**If you can't run `winapp` yourself** (no shell, or the command is denied), give the user the exact `winapp` command(s) for their project instead of only describing the steps.
+
 ## When to use
 - Inspecting a running Windows app's UI from the command line
 - AI agents interacting with Windows applications (clicking buttons, reading text, taking screenshots)
@@ -52,8 +55,9 @@ Rules that matter when driving this from an agent:
   else for its whole duration.
 - **Ordering is owner affinity, then FIFO.** An active workflow may keep issuing commands ahead of
   others already waiting; once it yields or its grace expires, waiters are served in arrival order.
-- **Waiting is indefinite and cancellable.** A status line appears after one second; Ctrl+C exits
-  `130` with error code `cancelled` and the command never ran.
+- **Waiting is indefinite and cancellable.** After one second a notice on stderr says what holds the
+  desktop and for how long (silent under `--json` and `--quiet`); Ctrl+C exits `130` with error code
+  `cancelled` and the command never ran.
 - **There is no hard cap** — a long script, unbounded recording, or failure loop can block other
   mutating workflows until it finishes or is stopped.
 
@@ -83,7 +87,9 @@ winapp ui wait-for Subject -a myapp --root MailRow --type Edit --value Ready --t
 ```
 
 Use `--root`, `--type`, and `--class-name` together or separately on `search`,
-`get-property`, `get-value`, and `wait-for`. The root must be unique; only its
+`get-property`, `get-value`, `wait-for`, and the commands that act on one
+selected element (`invoke`, `set-value`, `click`, `focus`, and so on; not `send-keys --target`).
+For `touch` and `pen`, filters need a selector; they can't be combined with `--at` or `--path`. The root must be unique; only its
 descendants match. `wait-for` re-resolves it every poll, including when it is
 initially absent. Type names and literal whole ClassName values ignore case.
 The only type aliases are `TextBox` → `Edit` and `TextBlock` → `Text`.
@@ -120,6 +126,22 @@ winapp ui invoke 'Save changes' -a myapp
 winapp ui invoke itm-samples-3f2c -a myapp; winapp ui wait-for pn-samplespage-b4e7 -a myapp; winapp ui inspect -a myapp --interactive
 ```
 
+### Choose an exact action in tests
+```powershell
+winapp ui invoke SettingsCategory -a myapp --action select
+winapp ui invoke AgreeCheckbox -a myapp --action toggle-on --json
+winapp ui invoke Open -w <dialog-HWND> --type Button --action invoke
+```
+
+Use `--action` to avoid automatic pattern and ancestor fallback. Omit it for the
+existing automatic behavior. With `--root`, `--type`, or `--class-name`, the
+filters follow the same matching rules as read queries: exactly one element must
+match inside the selected app/window, or the command fails without acting, and
+the ancestor fallback is skipped. See the
+[action reference](https://github.com/microsoft/winappCli/blob/main/docs/ui-automation.md#invoke)
+for supported actions, scope, idempotent toggles, and failure recovery, and the
+[JSON envelope](references/ui-json-envelope.md#ui-invoke---json) for action results.
+
 ### Disambiguate duplicate elements
 ```powershell
 # When text search matches multiple elements, the error shows slugs for each — pick the right one
@@ -135,7 +157,7 @@ winapp ui invoke Submit -a myapp
 - **AutomationId selectors**: When an element has a unique AutomationId, it becomes the selector directly (e.g., `[MinimizeButton]`). These survive layout changes and localization — preferred for stable targeting.
 - **Slug selectors**: When no unique AutomationId exists, a generated slug is used (e.g., `[btn-close-a2b3]`). Format: `prefix-name-hash`. May go stale after UI changes.
 - **Plain text search**: `search` and `invoke` accept plain text — `search Minimize` finds elements with "Minimize" in their Name or AutomationId (substring, case-insensitive). No special syntax needed.
-- **`--interactive` flag**: Filters to invokable elements only with auto-depth 8 — the fastest way to see what you can click
+- **`--interactive` flag**: Filters to elements you can invoke, click, or set-value (including text documents) with auto-depth 8 — the fastest way to see what you can act on
 - **Invokable ancestor surfacing**: When a search result isn't invokable, the nearest invokable parent is shown with its selector
 - **`;` chaining**: Chain commands with `;` to run multiple operations in one call, reducing agent round-trips
 - **`-a` vs `-w`**: Use `-a` to find apps by name/title/PID. Use `-w <HWND>` for stable window targeting
@@ -145,13 +167,13 @@ winapp ui invoke Submit -a myapp
 
 ### Connect and discover
 ```powershell
-# Connect and see interactive elements in one call
+# Core loop and examples: `winapp ui --help`. Connect and see interactive elements in one call:
 winapp ui status -a myapp; winapp ui inspect -a myapp --interactive
 ```
 
 ### Inspect element tree
 ```powershell
-winapp ui inspect -a myapp --interactive      # invokable elements only, auto-depth 8
+winapp ui inspect -a myapp --interactive      # elements you can invoke, click, or set-value; auto-depth 8
 winapp ui inspect -a myapp --depth 5          # deeper tree at depth 5
 winapp ui inspect txt-searchbox-e5f6 -a myapp  # subtree rooted at element
 winapp ui inspect btn-settings-a1b2 -a myapp --ancestors  # walk up from element to root
@@ -167,16 +189,19 @@ winapp ui search image -a myapp               # case-insensitive substring match
 
 ### Screenshot
 ```powershell
-# Full window screenshot
+# App screenshot (may include owned windows in a labeled composite)
 winapp ui screenshot -a myapp --output page.png
 
 # Crop to element; capture with popups visible
 winapp ui screenshot txt-searchbox-e5f6 -a myapp --output search.png
-winapp ui screenshot -a myapp --capture-screen --output with-popups.png
+winapp ui list-windows -a myapp # use the main window's HWND below
+winapp ui screenshot -w <hwnd> --capture-screen --output with-popups.png
 
 # Bring window to foreground first (matches what the user is currently seeing)
 winapp ui screenshot -a myapp --focus --output focused.png
 ```
+
+Default capture includes owned windows even with an explicit main HWND; it produces one labeled composite, not separate image files. An element selector for an item in an open menu, flyout, tooltip, or teaching tip crops from that item's popup window, so you don't need `--capture-screen` for it. For scope and on-screen overlay placement, see [Screenshot](https://github.com/microsoft/WinAppCli/blob/main/docs/ui-automation.md#screenshot). With `--on sandbox`, the reported screenshot path is the delivered host destination.
 
 ### Record video (H.264 MP4)
 Record a window or element region to MP4. Prefer a positive `--duration-sec N` for
@@ -203,16 +228,19 @@ winapp ui record -a myapp --capture-screen --duration-sec 5 --output with-popups
   and follow `recoveryHint`.
 - `--capture-screen` captures from the screen DC so overlays and popups are included; the window is brought to the foreground first. When WGC is unavailable and `--capture-screen` is not passed, the CLI returns an error — re-run with `--capture-screen` to consent to screen-DC capture. Because the screen DC captures whatever is genuinely in front, the target's foreground is **verified immediately before capture**; if activation was refused the command fails with `foreground_not_target` and writes nothing rather than returning an image of the wrong window.
 - Providing a selector that doesn't match any element fails immediately with `element_not_found` (rather than silently recording the whole window).
+- A selector for an item in an open menu, flyout, tooltip, or teaching tip records from that item's popup window, not the window behind it.
 - `--json` writes the final result to stdout and one JSON event per line to stderr.
 
 ### Hover (for tooltips, flyouts, hover states)
 `--dwell-time <ms>` sets how long to wait after hovering (default: 800, range: 0–10000).
 ```powershell
+winapp ui list-windows -a myapp # use the main window's HWND below, not the tooltip's
+
 # Hover to trigger tooltip, then capture it (default 800ms dwell)
-winapp ui hover btn-info-a1b2 -a myapp; winapp ui screenshot -a myapp --capture-screen --output tooltip.png
+winapp ui hover btn-info-a1b2 -a myapp; winapp ui screenshot -w <hwnd> --capture-screen --output tooltip.png
 
 # Longer dwell for apps with slow tooltip timers
-winapp ui hover btn-info-a1b2 -a myapp --dwell-time 1200; winapp ui screenshot -a myapp --capture-screen
+winapp ui hover btn-info-a1b2 -a myapp --dwell-time 1200; winapp ui screenshot -w <hwnd> --capture-screen
 ```
 
 ### Send keyboard input
@@ -238,7 +266,12 @@ winapp ui send-keys "enter" -a myapp --via send-input
 
 # Fire a global hotkey: win+... is refused by default (acts on the shell); opt in with --allow-system-keys
 winapp ui send-keys "win+shift+v" -a myapp --via send-input --allow-system-keys
+
+# Screen-reader command: hold capslock or insert (Narrator+Ctrl+F12 toggles Narrator developer mode)
+winapp ui send-keys "ctrl+capslock+f12" -a myapp --via send-input
 ```
+- Screen-reader commands hold `capslock` or `insert` as a modifier (`ctrl+capslock+f12`) and require `--via send-input`; post-message errors because screen readers don't receive posted keys. If no screen reader is running, holding `capslock` turns Caps Lock on or off (the command warns); hold `insert` to avoid this.
+- A token that starts with a modifier but has an unknown middle segment (`ctrl+a+b`) is an error, not literal text; use `text=` or `--verbatim` to type it.
 - Default `post-message` is HWND-targeted and works across integrity levels, but can't fire `WH_KEYBOARD_LL` global hotkeys. It automatically retargets to the **focused child control** of the target window, so classic Win32/WinForms child-window controls (e.g. an edit box) receive the input. **WinUI 3 / UWP / XAML controls are windowless and ignore posted `WM_CHAR`/`WM_KEYDOWN`** — post-message can't deliver keys *or* text to them (the command emits a warning and still exits 0, since `PostMessage` can't confirm delivery). Use **`--via send-input`** for WinUI 3 / UWP / XAML apps.
 - A token that collides with a key/modifier name (e.g. `enter`, `down`, `ctrl+a`) is pressed as that key. Prefix it with `text=` to type it as literal text instead — `text=enter` types the word "enter"; chain `text=` tokens to type a literal phrase like `text=down text=down text=enter`. Backslash escapes inside a `text=` value type whitespace the tokenizer would otherwise collapse: `\s`→space, `\t`→tab, `\n`→newline, `\r`→CR, `\\`→backslash (e.g. `text=a\s\sb` → "a  b"). When the *whole* argument is literal text, pass `--verbatim` instead of escaping each token: it types the entire keys argument as-is (no key/combo/`vk=`/`text=` parsing) and preserves exact whitespace — `send-keys "down down enter" --verbatim` types the words. (`--verbatim` does not decode backslash escapes; use a `text=` token for control characters.)
 - `send-input` is fully real input but goes to the foreground window and is UIPI-blocked when injecting from elevated → AppContainer/AppX. It **rejects system-reserved combos** (`win+l`, `alt+f4`, `ctrl+shift+esc`, `ctrl+alt+del`, `alt+tab`, …) because those act on the OS/shell, not just the target — pass **`--allow-system-keys`** to opt in (e.g. to fire a global hotkey such as PowerToys' `win+shift+v` or `win+r`), or use `--via post-message` (window-scoped) to send one straight to the window. **`win+l` and `ctrl+alt+del` stay blocked even with `--allow-system-keys`** — `win+l` locks the workstation via `LockWorkStation()` (unrecoverable from automation), and `ctrl+alt+del` is a Secure Attention Sequence (SAS) that Windows drops from injected input regardless of the flag, so it errors (`invalid_arguments`) instead of falsely reporting success. On a locked/secure desktop `send-input` fails fast with `no_interactive_desktop`.
@@ -302,11 +335,41 @@ winapp ui get-property chk-agreecheckbox-b2c3 -a myapp --property ToggleState
 winapp ui get-property txt-textbox-a4b1 -a myapp --property Value
 winapp ui get-property cmb-modellist-d5e6 -a myapp --property IsSelected
 
+# Read formatting across the whole text document (not the selection)
+winapp ui get-property Document -a myapp --property FontWeight --json
+
 # See what has keyboard focus
 winapp ui get-focused -a myapp
 ```
 
+For `get-focused`, `-a` includes windows in the selected process; `-w` restricts
+focus to that exact window, excluding its owned popups. A control can belong to
+the target through its parent window even when it omits its own process ID.
+See `references/ui-json-envelope.md` for focus no-match and query-error handling.
+
+To check a blank or cleared field, use `winapp ui wait-for SearchBox -a myapp --value ""`.
+See [empty-value behavior](https://github.com/microsoft/winappcli/blob/main/docs/ui-automation.md#get-value)
+for JSON output and reading the accessibility label separately.
+
+`get-property` also accepts `FontName`, `FontSize`, `ForegroundColor`, `IsItalic`,
+and `StrikethroughStyle`. Omit `--property` to include all six formatting attributes.
+Treat `Mixed`, `NotSupported`, and `Unavailable` as distinct states, not formatting
+values. Names are case-sensitive; unknown names fail with `invalid_arguments`.
+See the [formatting reference](https://github.com/microsoft/winappcli/blob/main/docs/ui-automation.md#whole-document-text-formatting)
+for units and state meanings, and `references/ui-json-envelope.md` for the JSON shape.
+
 ### Set values
+To prepare a control for keyboard input, use `winapp ui focus <selector> -a <app>`
+(keep `--on sandbox` when working in Sandbox). It activates the control's window
+and verifies both foreground and keyboard focus before success. It restores a
+minimized window first. If a command reports the target window is minimized (some
+apps, such as Calculator, hide their UI until restored), run
+`winapp ui focus -a <app>` (no selector) to restore and activate it, then retry. Do not use a
+screenshot as a focus workaround. If activation is refused, inspect for a blocking
+dialog and ask the user to activate the intended window; do not retry in a loop
+or switch to the local desktop. See the [focus reference](https://github.com/microsoft/winappcli/blob/main/docs/ui-automation.md#focus)
+for failure codes and recovery.
+
 `set-value` writes programmatically (no keystrokes, no foreground) via a fallback chain: ValuePattern → RangeValuePattern (numeric) → LegacyIAccessible `put_accValue` for TextPattern-only edit controls.
 ```powershell
 winapp ui set-value txt-searchbox-e5f6 "hello" -a myapp        # TextBox/ComboBox via ValuePattern
@@ -344,15 +407,16 @@ winapp ui wait-for itm-status-c3d4 -a myapp --value "Complete" --timeout 5000
 ```
 
 ## Tips
-- Use `--interactive` with `inspect` as your first command — it shows only what you can click
+- Use `--interactive` with `inspect` as your first command — it shows only what you can act on
 - Chain commands with `;` to reduce round-trips (see note below on why not `&&`)
 - Use slugs from output to target specific elements — they're hash-validated and shell-safe
 - Use plain text search to find elements: `search Minimize`, `invoke Submit`
 - When multiple elements match text search, the error shows slugs for each — pick the right one
 - Use `get-property --property ToggleState` to verify checkbox/toggle state after invoke
 - `scroll` auto-finds the nearest scrollable parent
-- Use `--capture-screen` to capture popup overlays, dropdown menus, and flyouts (also brings the window to the foreground)
-- Use `hover` before `screenshot --capture-screen` to capture tooltips and hover-triggered UI
+- To capture one item in an open menu, flyout, tooltip, or teaching tip, pass its selector to `screenshot` or `record`; it is captured from its popup window
+- Follow [Screenshot](#screenshot) to select a window with `-w <hwnd> --capture-screen` when you need popups in place over the window, or overlays the app doesn't own
+- Follow [Hover](#hover-for-tooltips-flyouts-hover-states) to capture tooltips and hover-triggered UI in place
 - Use `--focus` to foreground the target window before capture without switching to screen-DC capture (default capture path uses Windows.Graphics.Capture and works while occluded)
 - Use `--hide-disabled` and `--hide-offscreen` to reduce noise
 
@@ -382,7 +446,7 @@ The `--json` envelope for `ui inspect`, `ui get-focused`, `ui search`, and `ui w
 
 - `ui inspect --json` now nests elements under `windows[].elements[]` (was a flat `elements[]`).
 - Each inspected window and the `ui status --json` target reports `windowDpi`, `scale`, `dpiAwareness`, and `coordinateSpace: "physical-screen-pixels"`. This is the target window's DPI context. The selected target fails fast on an unreadable DPI instead of defaulting to 96; a secondary window that disappears mid-walk carries `dpiError` and omits the four context fields.
-- `ui get-focused --json` always emits an envelope — `{ "hasFocus": false }` or `{ "hasFocus": true, "element": {...} }` (was bare `null`).
+- Successful `ui get-focused --json` queries emit `{ "hasFocus": false }` or `{ "hasFocus": true, "element": {...} }` (was bare `null`); query failures exit nonzero with the standard JSON error on stderr, not a `hasFocus` result.
 - `ui search --json` returns `{ "matchCount", "hasMore", "matches" }`; `ui wait-for --json` returns `{ "found", "waitedMs", "element"?, "timedOut" }`.
 - `ui get-property --json` preserves `elementId` and its string-valued `properties` map, and adds a typed, scrubbed `element`.
 - Typed elements use `type` (not `controlType`) and numeric `x`, `y`, `width`, and `height` in physical screen pixels. `0,0,0,0` is UIA's empty/no-displayed-UI rectangle; `isOffscreen` remains independent.
@@ -421,7 +485,7 @@ including default filenames and `--frames` directories, return to the host.
 | "Element may have changed" | Slug hash doesn't match current element | Re-run `inspect` to get fresh slugs |
 | "does not support any invoke pattern" | Element can't be invoked | The error shows the invokable ancestor slug if one exists — use that |
 | "No UIA window found" | UIA can't see the window | Use `list-windows` to find HWND, then `-w` |
-| Popup not in screenshot | Default capture path doesn't include unowned overlays | Use `--capture-screen` flag |
+| Popup not in screenshot | Default capture path doesn't include unowned overlays | For one item in an open menu or flyout, pass its selector. To show popups in place or capture unowned overlays, follow [Screenshot](#screenshot) to select a window with `-w <hwnd> --capture-screen` |
 | `foreground_not_target` from `--capture-screen` | Windows refused the activation (focus-stealing prevention, UAC prompt, another window activating itself), so a screen capture would have recorded the wrong window | Click the target window, close the window that stole focus, then retry — or drop `--capture-screen` to capture the window directly |
 | `element_not_found` during record | Selector given but element not in tree | Re-run `inspect` or `search` to get a fresh selector |
 | `ambiguous_selector` during record | Plain-text selector matched multiple elements | Use a slug from the suggestions in the error message, or from `inspect` output |

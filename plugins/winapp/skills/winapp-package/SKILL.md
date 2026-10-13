@@ -1,7 +1,10 @@
 ---
 name: winapp-package
-description: Package a Windows app as an MSIX installer for distribution or testing. Use when creating a Windows installer, packaging an Electron/Flutter/.NET/Rust/C++/Tauri app for Windows, building an MSIX, distributing a desktop app, packaging a console app or CLI tool, or adding MSIX packaging to a build script or CI/CD pipeline.
+description: Build an MSIX installer for a desktop, console, or CLI app (Electron, .NET, C++, Rust, Flutter, Tauri) from build output or a .csproj with winapp package, optionally signed. Use for an installer testers can sideload, app distribution, or MSIX in scripts or CI. Not for signing an existing MSIX.
 ---
+
+**If you can't run `winapp` yourself** (no shell, or the command is denied), give the user the exact `winapp` command(s) for their project instead of only describing the steps.
+
 ## When to use
 
 Use this skill when:
@@ -12,12 +15,35 @@ Use this skill when:
 
 ## Prerequisites
 
-Before packaging, you need:
-1. **Built app output** in a folder (e.g., `bin/Release/`, `dist/`, `build/`)
-2. **`Package.appxmanifest`** — from `winapp init` or `winapp manifest generate`
-3. **Certificate** (optional) — `devcert.pfx` from `winapp cert generate` for signing
+What you need depends on the input:
+- **Project mode** (`winapp package MyApp.csproj`): an explicit `.csproj` for a packaged app (`EnableMsixTooling=true` with a `Package.appxmanifest`). winapp publishes it and packages the output.
+- **Folder mode** (`winapp package ./bin/Release`): **built app output** in a folder (e.g., `bin/Release/`, `dist/`, `build/`) plus a **`Package.appxmanifest`** in the current directory, passed via `--manifest`, or in the folder.
+- **Certificate** (optional, both modes) — `devcert.pfx` from `winapp cert generate` for signing.
 
 ## Usage
+
+### Package directly from a .csproj (project mode)
+
+```powershell
+# Publish the project and create an MSIX in one step (no need to build or locate the output first)
+winapp package ./MyApp.csproj
+
+# Override configuration/architecture, or sign in the same step (project mode defaults to Release)
+winapp package ./MyApp.csproj -c Debug --arch arm64 --cert ./devcert.pfx
+
+# Package an already-built output without rebuilding
+winapp package ./MyApp.csproj --no-build
+
+# Produce an architecture .msixbundle from one project (publishes each arch, then bundles)
+winapp package ./MyApp.csproj --arch x64 --arch arm64 --cert ./devcert.pfx
+```
+
+Project mode is triggered only by an explicit `.csproj`. It publishes the project — so trimmed or
+self-contained apps package what actually ships — with the build options
+(`-c/--configuration`, `--arch`, `-f/--framework`, `--no-build`, `--no-restore`,
+repeatable `-p`), defaults to the **Release** configuration, resolves the published output, and
+packages it. If the project publishes as an unpackaged app (`WindowsPackageType=None`) there is no
+manifest to package and the command errors. Folder, bundle, and sparse-manifest inputs are unchanged.
 
 ### Basic packaging (unsigned)
 
@@ -47,6 +73,14 @@ winapp package ./bin/Release --generate-cert
 
 # Also install the cert to trust it on this machine (requires admin)
 winapp package ./bin/Release --generate-cert --install-cert
+```
+
+### Unsigned output (Store submission or external signing)
+
+```powershell
+# Force an unsigned package. For a .csproj that configures its own signing, this overrides it.
+# Cannot be combined with --cert or --generate-cert.
+winapp package ./MyApp.csproj --no-sign
 ```
 
 ### Self-contained deployment
@@ -142,7 +176,7 @@ The `ProcessorArchitecture` is always force-set to the detected architecture per
 
 **Output:** `<Name>_<Version>_<arch1>_<arch2>.msixbundle` (architectures sorted alphabetically).
 
-**Store submission:** An unsigned bundle is valid for Store upload — Partner Center signs it with your reserved identity certificate. For sideloading, pass `--cert` or `--generate-cert`.
+**Store submission:** An unsigned bundle is valid for Store upload — Partner Center signs it with your reserved identity certificate. For sideloading, pass `--cert` or `--generate-cert`. To submit or manage the listing from the command line, use `winapp store <args>` (passthrough to the Microsoft Store Developer CLI, downloaded on first use).
 
 This hashes executables in the specified directories so Windows trusts them when running with sparse package identity.
 
@@ -199,7 +233,7 @@ The `.msix` contains only the manifest — binaries and assets are resolved from
 |-------|-------|----------|
 | "Package.appxmanifest not found" | No manifest in input folder or current dir | Run `winapp init` or `winapp manifest generate` first |
 | "Publisher mismatch" | Cert publisher ≠ manifest publisher | Regenerate cert with `winapp cert generate --manifest`, or edit manifest |
-| "Package installation failed" | Cert not trusted or stale package | Run `winapp cert install ./devcert.pfx` (admin), then `Get-AppxPackage <name> \| Remove-AppxPackage` |
+| "Package installation failed" | Cert not trusted or stale package | Run `winapp cert install ./devcert.pfx` (admin). If an earlier `winapp run` registration is in the way, remove it with `winapp unregister <input>` rather than deleting packages by name |
 | "makeappx not found" | Build tools not downloaded | Run `winapp update` or `winapp tool makeappx --help` to trigger download |
 
 ## CLI reference

@@ -135,6 +135,8 @@ internal sealed class UiInvokeResult
 {
     public string ElementId { get; set; } = "";
     public string Pattern { get; set; } = "";
+    public string RequestedAction { get; set; } = "";
+    public string PerformedAction { get; set; } = "";
     public long Hwnd { get; set; }
 }
 
@@ -233,8 +235,8 @@ internal sealed class UiWaitForResult
     public bool TimedOut { get; set; }
 }
 
-/// <summary>Envelope for <c>ui get-focused --json</c>. Always emitted (even when no element has focus)
-/// so consumers can deterministically detect the no-focus case.</summary>
+/// <summary>Envelope for successful <c>ui get-focused --json</c> queries, including no-match results.
+/// Query failures emit the standard error envelope instead.</summary>
 internal sealed class UiFocusedResult
 {
     public bool HasFocus { get; set; }
@@ -252,6 +254,10 @@ internal sealed class UiErrorInfo
     public string Message { get; set; } = "";
     public string? Selector { get; set; }
     public string? Details { get; set; }
+
+    /// <summary>Likely intended commands, for an unknown <c>winapp ui</c> command. Omitted otherwise.</summary>
+    public string[]? Suggestions { get; set; }
+
     public string? RecoveryHint { get; set; }
     public UiPartialOutputInfo? PartialOutput { get; set; }
 
